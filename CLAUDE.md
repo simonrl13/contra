@@ -25,6 +25,10 @@ Learning matters more than speed.
 
 ## Code conventions
 - Package by feature: `account`, `ledger`, `transfer`, `common`. Controller → Service → Repository.
+- Balance changes go through `Account.debit/credit` (guards only). Ledger entries for transfers come from
+  `LedgerEntry.transferDebit/transferCredit`, which set the sign. Business rejections are
+  `TransferRejectedException(Reason)` → 422 with a `reason` property.
+- Migrations so far: V1 accounts, V2 ledger_entries, V3 transfers (+ FK ledger_entries.transfer_id).
 - Entities reference other aggregates by id (UUID), not `@ManyToOne`.
 - API error messages are English (`spring.web.locale: en`, fixed resolver).
 - DTOs are Java records at the API boundary. Entities never leave the service layer.
@@ -34,19 +38,19 @@ Learning matters more than speed.
 - No secrets in code or commits. Config comes from environment variables; `.env` is git-ignored.
 
 ## Working rules (strict)
-1. Plan first; get approval before writing code.
-2. One stage at a time. After each stage: run `./mvnw verify`, show the diff summary, explain the key
-   Spring/Java concepts as needed for an interview, then STOP and wait.
-3. The owner writes the core logic: transfer validation, balance update, ledger entries, locking and
-   idempotency. Claude writes signatures, failing tests and TODO comments, then reviews critically.
-   Claude writes boilerplate (config, DTOs, migrations, Docker, CI).
-4. In stages 3-5, never offer to write the owner's logic, even when they're stuck. Give hints first,
-   escalating only when asked.
-5. End each stage with 3 interview-style questions, and add a short entry to `NOTES.md`
-   (what we built, key concepts, the questions).
-6. Only claim what a test or a run has verified. Never call anything "production-ready".
-7. One commit per stage, only after the owner approves the stage, with a clear message.
-8. Note Spring Boot 4 vs 3.x API differences as they come up (interviewers may know 3.x better).
+Updated 2026-11-24: the owner now lets Claude write all the code (AI tools are allowed in the interview)
+and reviews everything afterwards. The job is to make that review easy and complete.
+1. Claude writes all the code, including the transfer core, idempotency and locking.
+2. Stages run back to back without stopping for approval. Stop only if a test fails and can't be fixed
+   cleanly, or if a decision would change an earlier approved design.
+3. One commit per stage, with a clear message, only after `./mvnw verify` passes.
+4. For each stage, `NOTES.md` gets: what we built, the thought process behind each non-trivial decision
+   (problem, options, choice, trade-off), a code walkthrough of the key methods, what an interviewer
+   would challenge, and 3-5 practice questions with answers in `<details>` blocks.
+5. Only claim what a test or a run has verified. Never call anything "production-ready".
+6. No secrets in code or commits. Simple, readable code.
+7. Note Spring Boot 4 vs 3.x API differences as they come up (interviewers may know 3.x better).
+8. Stage 7 (AWS) is preparation only: docs and config, no AWS resources created, no credentials asked for.
 
 ## Stages
-1. Setup  2. Account  3. Transfer + ledger  4. Idempotency  5. Concurrency  6. Docker + CI + docs  7. AWS
+1. Setup  2. Account  3. Transfer + ledger  4. Idempotency  5. Concurrency  6. Docker + CI + docs  7. AWS (plan only)

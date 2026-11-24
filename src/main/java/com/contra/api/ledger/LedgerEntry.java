@@ -57,6 +57,16 @@ public class LedgerEntry {
 		return new LedgerEntry(accountId, LedgerEntryType.OPENING, amount, null);
 	}
 
+	/** Money leaving an account. Takes the positive transfer amount and stores it negated. */
+	public static LedgerEntry transferDebit(UUID accountId, BigDecimal amount, UUID transferId) {
+		return new LedgerEntry(accountId, LedgerEntryType.TRANSFER_DEBIT, amount.negate(), transferId);
+	}
+
+	/** Money arriving on an account. Takes the positive transfer amount and stores it as is. */
+	public static LedgerEntry transferCredit(UUID accountId, BigDecimal amount, UUID transferId) {
+		return new LedgerEntry(accountId, LedgerEntryType.TRANSFER_CREDIT, amount, transferId);
+	}
+
 	public UUID getId() {
 		return id;
 	}

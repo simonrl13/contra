@@ -50,6 +50,34 @@ public class Account {
 		this.createdAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
 	}
 
+	/** True if the balance covers the amount. Leaving exactly 0 is allowed. */
+	public boolean hasFundsFor(BigDecimal amount) {
+		return balance.compareTo(amount) >= 0;
+	}
+
+	/**
+	 * Takes money out. The service checks the business rules first and rejects with a proper reason;
+	 * these guards only stop a programming error from corrupting the balance.
+	 */
+	public void debit(BigDecimal amount) {
+		requirePositive(amount);
+		if (!hasFundsFor(amount)) {
+			throw new IllegalStateException("Debit of " + amount + " would make account " + id + " negative");
+		}
+		balance = balance.subtract(amount);
+	}
+
+	public void credit(BigDecimal amount) {
+		requirePositive(amount);
+		balance = balance.add(amount);
+	}
+
+	private static void requirePositive(BigDecimal amount) {
+		if (amount.signum() <= 0) {
+			throw new IllegalArgumentException("Amount must be positive, was " + amount);
+		}
+	}
+
 	public UUID getId() {
 		return id;
 	}

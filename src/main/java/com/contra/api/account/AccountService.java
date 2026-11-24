@@ -8,6 +8,8 @@ import com.contra.api.common.NotFoundException;
 import com.contra.api.ledger.LedgerEntry;
 import com.contra.api.ledger.LedgerEntryRepository;
 
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -42,5 +44,15 @@ public class AccountService {
 		return accountRepository.findById(id)
 				.map(AccountResponse::from)
 				.orElseThrow(() -> new NotFoundException("Account", id));
+	}
+
+	/** An account's ledger entries, newest first. 404 for an unknown account rather than an empty page. */
+	@Transactional(readOnly = true)
+	public Page<TransactionResponse> listTransactions(UUID accountId, int page, int size) {
+		if (!accountRepository.existsById(accountId)) {
+			throw new NotFoundException("Account", accountId);
+		}
+		return ledgerEntryRepository.findByAccountIdOrderByCreatedAtDescIdDesc(accountId, PageRequest.of(page, size))
+				.map(TransactionResponse::from);
 	}
 }

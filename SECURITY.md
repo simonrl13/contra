@@ -24,9 +24,9 @@ caller owns the source account.
 ## Threat model
 | Threat | Mitigation | Status |
 |---|---|---|
-| Malformed or hostile input | Bean Validation on request DTOs (lengths, signs, at most 2 decimals, ISO currency); errors returned as ProblemDetail without stack traces or Jackson internals | Accounts: Stage 2. Transfers: Stage 3 |
+| Malformed or hostile input | Bean Validation on request DTOs (lengths, signs, at most 2 decimals, ISO currency); errors returned as ProblemDetail without stack traces or Jackson internals | Stages 2 and 3 |
 | SQL injection | JPA, Spring Data derived queries and parameterised JPQL only; no string-built SQL | Stage 2, re-checked each stage |
-| Invalid data reaching the DB through a bug | CHECK constraints: balance >= 0, debit/credit signs, ISO currency format | Stage 2 |
+| Invalid data reaching the DB through a bug | CHECK constraints: balance >= 0, debit/credit signs, ISO currency format, transfer amount > 0 and different accounts; FK from ledger entries to transfers | Stages 2 and 3 |
 | Double spending through retries | Required `Idempotency-Key` with a unique constraint; a key reused with a different payload is rejected (422) | Stage 4 |
 | Overdraft through concurrent requests | Row locking plus a `CHECK (balance >= 0)` constraint in the database | Stages 2 and 5 |
 | Idempotency key abuse (guessing or reusing someone else's key) | Keys are scoped to the request payload. Without authentication they can't be scoped per client, a known gap | Partial, Stage 4 |
@@ -47,6 +47,7 @@ caller owns the source account.
 
 ## AI features and AI-assisted development
 - The application has **no AI features**: no model calls, so no prompt-injection surface and no data sent to a model at runtime.
-- Parts of the code were written with an AI assistant. Every change is reviewed by the maintainer and
-  covered by tests before it's committed, and it's treated as untrusted until then. No secrets are
-  ever pasted into prompts.
+- The code was written with an AI assistant (Claude Code). Stages 1-2 were reviewed by the maintainer
+  before each commit. From Stage 3 on, the assistant wrote all the code and committed each stage once
+  `./mvnw verify` passed; the maintainer reviews those commits afterwards, and the code is treated as
+  untrusted until that review is done. No secrets are ever pasted into prompts.

@@ -3,6 +3,8 @@ package com.contra.api.common;
 import java.util.Map;
 import java.util.TreeMap;
 
+import com.contra.api.transfer.TransferRejectedException;
+
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -10,12 +12,12 @@ import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.FieldError;
-import tools.jackson.core.JacksonException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
+import tools.jackson.core.JacksonException;
 
 /**
  * Single place that turns exceptions into HTTP error responses.
@@ -30,6 +32,14 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 	@ExceptionHandler(NotFoundException.class)
 	ProblemDetail handleNotFound(NotFoundException exception) {
 		return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, exception.getMessage());
+	}
+
+	/** Well-formed request that breaks a business rule: 422, with a machine-readable reason. */
+	@ExceptionHandler(TransferRejectedException.class)
+	ProblemDetail handleTransferRejected(TransferRejectedException exception) {
+		ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.UNPROCESSABLE_CONTENT, exception.getMessage());
+		problem.setProperty("reason", exception.getReason().name());
+		return problem;
 	}
 
 	/** Bean Validation failure on a @Valid request body: 400, listing every invalid field. */

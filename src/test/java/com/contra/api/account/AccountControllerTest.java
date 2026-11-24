@@ -3,13 +3,17 @@ package com.contra.api.account;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.Currency;
+import java.util.List;
 import java.util.UUID;
 
 import com.contra.api.common.NotFoundException;
+import com.contra.api.ledger.LedgerEntryType;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
@@ -119,6 +123,39 @@ class AccountControllerTest {
 				.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
 				.andExpect(jsonPath("$.status").value(404))
 				.andExpect(jsonPath("$.detail").value("Account " + ACCOUNT_ID + " not found"));
+	}
+
+	@Test
+	void transactionsReturnsAPageWithDefaults() throws Exception {
+		TransactionResponse opening = new TransactionResponse(UUID.randomUUID(), LedgerEntryType.OPENING,
+				new BigDecimal("100.00"), null, Instant.parse("2026-01-15T10:00:00Z"));
+		when(accountService.listTransactions(ACCOUNT_ID, 0, 20))
+				.thenReturn(new PageImpl<>(List.of(opening), PageRequest.of(0, 20), 1));
+
+		mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_ID))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.content[0].type").value("OPENING"))
+				.andExpect(jsonPath("$.content[0].transferId").isEmpty())
+				.andExpect(jsonPath("$.page.number").value(0))
+				.andExpect(jsonPath("$.page.size").value(20))
+				.andExpect(jsonPath("$.page.totalElements").value(1));
+	}
+
+	@Test
+	void transactionsRejectsPageSizeAbove100() throws Exception {
+		mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_ID).param("size", "101"))
+				.andExpect(status().isBadRequest())
+				.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON));
+
+		verifyNoInteractions(accountService);
+	}
+
+	@Test
+	void transactionsRejectsNegativePage() throws Exception {
+		mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_ID).param("page", "-1"))
+				.andExpect(status().isBadRequest());
+
+		verifyNoInteractions(accountService);
 	}
 
 	@Test

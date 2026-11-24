@@ -53,5 +53,17 @@ class AccountApiIntegrationTest {
 
 		UUID accountId = UUID.fromString(location.substring("/accounts/".length()));
 		assertThat(ledgerEntryRepository.sumAmountsByAccountId(accountId)).isEqualByComparingTo(new BigDecimal("250.50"));
+
+		mockMvc.perform(get(location + "/transactions"))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.page.totalElements").value(1))
+				.andExpect(jsonPath("$.content[0].type").value("OPENING"))
+				.andExpect(jsonPath("$.content[0].amount").value(250.50));
+	}
+
+	@Test
+	void transactionsOfAnUnknownAccountIs404() throws Exception {
+		mockMvc.perform(get("/accounts/{id}/transactions", UUID.randomUUID()))
+				.andExpect(status().isNotFound());
 	}
 }

@@ -102,3 +102,170 @@ Postgres, and one full-stack test.
    What does each layer give you that the other doesn't?
 3. In a test, `new BigDecimal("100").equals(new BigDecimal("100.00"))` is false. Why, and how do you
    compare money safely in Java and in AssertJ?
+
+---
+
+## Stage 3: Transfer + ledger
+
+### What we built
+`POST /transfers` moves money between two accounts in the same currency and returns 201 with a
+`Location`. `GET /transfers/{id}` reads it back. `GET /accounts/{id}/transactions` is the statement:
+ledger entries, newest first, paginated. Migration `V3__transfers` adds the `transfers` table and the
+foreign key from `ledger_entries.transfer_id`. Every transfer writes one transfer row, one negative
+`TRANSFER_DEBIT` entry and one positive `TRANSFER_CREDIT` entry, and changes both balances, all in one
+transaction. Broken business rules return 422 with a machine-readable `reason`.
+
+### Thought process
+**Where do balance changes live?**
+- Problem: something has to change `balance`, and nothing else should be able to set it to any value.
+- Options: (a) a setter, with the service doing the maths; (b) `debit(amount)` / `credit(amount)` on
+  `Account`; (c) recompute the balance from the ledger every time.
+- Chosen: (b). There is no setter, so the only ways to change a balance are the two methods, and each
+  guards its own invariant (amount > 0, a debit never goes negative).
+- Trade-off: the guards throw `IllegalStateException`/`IllegalArgumentException`, not the 422 exception,
+  because `account` must not depend on the `transfer` package (that would be a package cycle). So the
+  service checks the rules first and throws the proper `TransferRejectedException`. The guards are a
+  second line that should never fire. Option (c) is the purest double-entry design, but every read
+  becomes a `SUM` over a growing table. A stored balance plus a tested invariant is the usual compromise.
+
+**Who decides the sign of a ledger amount?**
+- Problem: a debit must be stored negative. If every caller writes `amount.negate()`, someone will
+  forget once.
+- Chosen: static factories `LedgerEntry.transferDebit(...)` and `transferCredit(...)`. They take the
+  positive transfer amount and set the sign. The CHECK constraint `ledger_entries_sign_matches_type` is
+  the backstop. The public constructor stays because a repository test uses it to write a wrong sign on
+  purpose and prove the constraint works.
+
+**Check everything, then change anything.**
+- Problem: if validation and mutation are interleaved, a late rejection leaves half-changed objects
+  in memory.
+- Chosen: all checks run first (amount, same account, existence, currency, funds), then the four
+  writes. The transaction would roll back the database anyway, but with this order a rejection never
+  even produces dirty entities. It's also easier to read and to test.
+
+**Saving accounts without `save()`.**
+Accounts loaded inside a `@Transactional` method are *managed*. Hibernate keeps a snapshot of each one,
+compares at flush time (dirty checking) and issues the `UPDATE` itself. Calling `save()` on a managed
+entity does nothing useful, and its presence suggests it's needed.
+
+**422 vs 400.**
+- 400 means "this request is malformed": a missing field, a wrong type, 3 decimals. The DTO's Bean
+  Validation catches it before the service runs.
+- 422 means "well-formed, but the business rules say no": not enough money, different currencies.
+  Only the service can know, because it needs the database.
+- `amount > 0` is checked in three places. The DTO gives a clean 400 at the HTTP edge. The service
+  can't assume every caller came through HTTP, so it checks again (defence in depth). The DB CHECK is
+  the third layer.
+
+**Why the request carries a currency.** The client states what it thinks it's moving. If that doesn't
+match the accounts, we reject it rather than move 100 USD when the client meant 100 EUR.
+
+**FK ordering.** `ledger_entries.transfer_id` references `transfers(id)`, so the transfer row must be
+inserted first. Hibernate executes inserts in the order they were registered, so `transferRepository.save`
+comes before `ledgerEntryRepository.saveAll`.
+
+**Integration tests for the service, not Mockito.** The service tests run against real Postgres and
+check outcomes (balances, rows, ledger sums), not which repository methods were called. A Mockito test
+would mostly restate the implementation, and it couldn't prove rollback or constraint behaviour. A small
+plain unit test (`AccountTest`) covers the `Account` guards and the ledger factories' signs.
+
+### Code walkthrough: `TransferService.transfer`
+```java
+BigDecimal amount = Money.normalize(request.amount());
+```
+Sets scale 2 with `RoundingMode.UNNECESSARY`, so `30` becomes `30.00` and the stored transfer, the
+ledger and the response all agree. Without it, `30` and `30.00` are different `BigDecimal`s (`equals`
+checks scale).
+```java
+if (amount.signum() <= 0) throw new TransferRejectedException(Reason.AMOUNT_NOT_POSITIVE);
+if (request.fromAccountId().equals(request.toAccountId())) throw ... SAME_ACCOUNT;
+```
+The cheap checks run first, before any query. Without the amount check, a negative amount would
+*reverse* the transfer (debit the target). Without the same-account check, the debit and credit cancel
+out, two pointless entries get written, and the DB CHECK turns it into a 500 instead of a 422.
+```java
+Account source = findAccount(request.fromAccountId());
+Account target = findAccount(request.toAccountId());
+```
+Loads both accounts; an unknown one is a 404. (Stage 5 replaces this with locked reads in a fixed order.)
+```java
+if (!source.getCurrency().equals(request.currency()) || !target.getCurrency().equals(request.currency())) ... CURRENCY_MISMATCH
+if (!source.hasFundsFor(amount)) ... INSUFFICIENT_FUNDS
+```
+Rules that need the loaded data. `hasFundsFor` uses `compareTo >= 0`, so emptying the account exactly
+is allowed. Remove it and `Account.debit` throws `IllegalStateException`: a 500 instead of a 422.
+```java
+source.debit(amount);
+target.credit(amount);
+```
+In-memory changes on managed entities. The `UPDATE`s happen at flush/commit.
+```java
+Transfer transfer = transferRepository.save(new Transfer(...));
+ledgerEntryRepository.saveAll(List.of(LedgerEntry.transferDebit(...), LedgerEntry.transferCredit(...)));
+```
+The transfer goes first because of the FK. Two entries whose amounts sum to zero: that's what makes it
+double-entry. Remove either one and "sum of entries = balance" breaks for one account.
+```java
+return TransferResponse.from(transfer);
+```
+A record DTO; the entity never leaves the service.
+
+The whole method is `@Transactional`: if anything throws a `RuntimeException`, Spring rolls back,
+balance changes included (they were either never flushed or are undone by the DB rollback). The test
+`rollsBackEverythingWhenTheLedgerWriteFails` proves it by making every save method on the ledger
+repository throw.
+
+### What an interviewer would challenge
+- **"What if the DB crashes between the debit and the credit?"** In the database there is no
+  "between": both `UPDATE`s and the three `INSERT`s are one transaction. Postgres writes the commit
+  record to the WAL atomically. After a crash it replays committed transactions and discards the rest.
+  Either all five statements happened or none did.
+- **"What if two transfers from the same account run at once?"** At this stage both read the same
+  balance. `@Version` on `Account` turns the second commit into an optimistic-lock failure (a 500 at
+  this stage), so no money is lost, but the client gets an error. Stage 5 fixes this with row locks.
+- **"Why store the balance at all if you have the ledger?"** Reading a balance is O(1). The cost is two
+  sources of truth that must agree, which is why the invariant is tested. A reconciliation job could
+  also check it in production.
+- **"Spring Data `save` with an assigned UUID?"** For an entity with an assigned id and no `@Version`,
+  `save` calls `merge`, which costs an extra `SELECT` per entity (Transfer and LedgerEntry here).
+  That's acceptable now. Implementing `Persistable<UUID>` with an `isNew` flag removes it if it ever matters.
+- **"Offset pagination at scale?"** `OFFSET 100000` still walks 100000 rows, and new entries shift
+  pages while a client is paging. Keyset pagination (`WHERE (created_at, id) < (?, ?)`) fixes both, and
+  the index `(account_id, created_at DESC)` already supports it.
+
+### Spring Boot 4 vs 3.x (seen in this stage)
+| | Boot 3.x | Boot 4.x |
+|---|---|---|
+| 422 constant | `HttpStatus.UNPROCESSABLE_ENTITY` | `HttpStatus.UNPROCESSABLE_CONTENT` (the RFC 9110 name) |
+| Spy on a bean | `@SpyBean` | `@MockitoSpyBean` |
+| Page JSON | `PageImpl` serialised directly (warned about since Spring Data 3.3) | `PagedModel`: `content` + `page` metadata |
+
+### Practice questions
+1. Why is "insufficient funds" a 422 and "amount has 3 decimals" a 400?
+   <details><summary>Answer</summary>400 is for a request that is malformed in itself: the DTO's
+   validation rejects it without touching the database. 422 is for a request that is well-formed but
+   breaks a business rule that depends on current state (the balance). The split tells the client
+   whether to fix the request or accept that the operation isn't possible right now. The `reason` field
+   lets a client branch on the cause without parsing text.</details>
+2. The service never calls `accountRepository.save(source)`. How does the new balance reach the database?
+   <details><summary>Answer</summary>Entities loaded in a transaction are managed by the persistence
+   context. At flush (before commit, or before a query that needs it), Hibernate compares each managed
+   entity with the snapshot taken at load time and issues an `UPDATE` for the changed ones. That's dirty
+   checking. It only works inside the transaction: with `open-in-view: false`, the entity is detached as
+   soon as the service method returns.</details>
+3. How does the test prove the transfer is atomic, and why can't a Mockito unit test prove it?
+   <details><summary>Answer</summary>`rollsBackEverythingWhenTheLedgerWriteFails` uses `@MockitoSpyBean`
+   on the ledger repository: real behaviour, except that every save method throws. After the call it
+   reads the balances and the transfer count from Postgres and expects them unchanged. The rollback is
+   done by Spring's transaction proxy and the database. A Mockito test has neither, so it could only
+   check that methods were called, not that nothing was committed.</details>
+4. Why does the ledger store a debit as a negative number rather than a positive number plus a type?
+   <details><summary>Answer</summary>So the balance is simply `SUM(amount)` with no `CASE` on the
+   type, and the debit and credit of one transfer sum to zero, which is easy to check. The type still
+   carries the meaning, and a CHECK constraint ties the two together (debit < 0, credit > 0) so they
+   can't disagree.</details>
+5. Why do all the checks run before any change, if the transaction rolls back anyway?
+   <details><summary>Answer</summary>Correctness doesn't depend on it, but it keeps the method easy to
+   reason about: a rejection leaves no dirty state in memory, nothing is flushed, and the reader sees
+   "validate, then act". It also avoids relying on rollback for normal control flow, which matters if
+   someone later catches the exception inside the transaction.</details>

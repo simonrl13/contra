@@ -1,0 +1,17 @@
+spring:
+  application:
+    name: contra-api
+  config:
+    # Lets a local .env file (KEY=value lines) supply the variables below. Optional: absent in CI/Docker/AWS.
+    import: optional:file:.env[.properties]
+  datasource:
+    # Only from environment variables. No defaults, so a missing variable fails fast instead of using a guess.
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+  jpa:
+    # Flyway owns the schema. Hibernate only checks that entities match it.
+    hibernate:
+      ddl-auto: validate
+    # No lazy loading during JSON rendering: DB access stays inside the service layer's transactions.
+    open-in-view: false

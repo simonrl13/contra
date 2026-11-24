@@ -1,0 +1,13 @@
+# Build output
+target/
+
+# Local secrets: never commit. Copy .env.example to .env instead.
+.env
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+
+# Claude Code per-machine settings
+.claude/settings.local.json

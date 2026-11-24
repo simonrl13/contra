@@ -1,0 +1,21 @@
+# Weekly pull requests for outdated dependencies. Spring Boot's parent manages most Maven versions,
+# so a parent bump is the main Maven update. Grouped to keep the PR count low.
+version: 2
+updates:
+  - package-ecosystem: maven
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      maven:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

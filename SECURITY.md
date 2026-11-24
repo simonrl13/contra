@@ -31,19 +31,29 @@ caller owns the source account.
 | Overdraft through concurrent requests | `SELECT ... FOR UPDATE` on both accounts, in a fixed order; `CHECK (balance >= 0)` in the database; tested with 200 concurrent transfers | Stages 2 and 5 |
 | Idempotency key abuse (guessing or reusing someone else's key) | A reused key only replays if the payload hash matches. Keys are global: without authentication they can't be scoped per client, so a client who knows another's key and payload can read that transfer. Keys never expire | Partial (known gap) |
 | Leaked credentials | Env vars only, `.env` git-ignored, IAM roles in AWS | Stage 1 (local), Stage 7 (AWS) |
-| Vulnerable dependencies | Versions managed by the Spring Boot parent; Dependabot alerts | Dependabot: Stage 6 |
+| Vulnerable dependencies | Versions managed by the Spring Boot parent; Dependabot weekly PRs for Maven, GitHub Actions and Docker base images | Stage 6 |
+| Compromised container | Runtime image has only the JRE and the jar, runs as uid 10001 (not root), jar owned by root and read-only to the app; no `.env` in the build context (`.dockerignore`) | Stage 6 |
+| Information leak through operational endpoints | Actuator exposes `health` only, without component details; `/actuator/env` etc. return 404 (tested) | Stage 6 |
+| CI supply chain | Workflow token is `contents: read`; no secrets in CI; actions pinned to a major version (Dependabot keeps them current). Not pinned to commit SHAs, a known gap | Stage 6 |
 | Database exposed on the network | Local Postgres port bound to `127.0.0.1` only; RDS in private subnets in AWS | Stage 1 (local), Stage 7 (AWS) |
 
 ## Known gaps
 - No authentication or authorisation (see above).
 - No rate limiting.
-- Swagger UI and `/v3/api-docs` are enabled in every environment. Decide in Stage 6/7 whether to
-  turn them off outside local development (`springdoc.api-docs.enabled=false`).
+- Swagger UI and `/v3/api-docs` are enabled by default (useful locally). The AWS plan turns them off
+  with environment variables (`SPRINGDOC_APIDOCS_ENABLED=false`, `SPRINGDOC_SWAGGERUI_ENABLED=false`);
+  see docs/aws.md.
+- Idempotency keys are global and never expire (see the threat model).
+- No lock timeout: a transaction stuck while holding an account lock makes other transfers on that
+  account wait. Mitigation if needed: `lock_timeout` / `idle_in_transaction_session_timeout` in PostgreSQL.
 - Supported framework line: Spring Boot 4.1.x, whose open-source support ends 2027-07-31.
 
 ## Dependency policy
 - Spring Boot's parent pom manages versions. Anything it doesn't manage (springdoc) is pinned explicitly in `pom.xml`.
 - New dependencies need a reason and a check of their maintenance status before they're added.
+  Stage 6 added `spring-boot-starter-actuator` (official Spring Boot module, version managed by the
+  parent) for the container and load-balancer health check.
+- Dependabot (`.github/dependabot.yml`) opens weekly PRs; CI must pass before one is merged.
 
 ## AI features and AI-assisted development
 - The application has **no AI features**: no model calls, so no prompt-injection surface and no data sent to a model at runtime.

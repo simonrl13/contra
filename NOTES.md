@@ -583,3 +583,147 @@ Boot one: `close()` waits for the submitted tasks to finish.
    unique constraint failed the second (409). Now the second blocks on the account lock until the first
    commits. Its lookup then sees the committed transfer and replays it, so both clients get 201 with the
    same transfer. The constraint still covers same-key requests on different accounts.</details>
+
+---
+
+## Stage 6: Docker + CI + docs
+
+### What we built
+A multi-stage `Dockerfile` (JDK build stage → JRE runtime stage, non-root uid 10001) and a
+`.dockerignore` that keeps `.env` out of the image. `docker-compose.yml` now runs the app and PostgreSQL,
+both with health checks, and the app waits for a healthy database. A GitHub Actions workflow runs
+`./mvnw -B verify` and builds the image. Dependabot covers Maven, Actions and Docker. Mockito is loaded
+as a Java agent, so the "self-attaching" warning is gone. Actuator exposes `/actuator/health` only. Final
+README and SECURITY.md.
+
+Verified by running it: `docker compose up -d --build --wait` brought both containers to `healthy`, and
+curl over HTTP exercised open account → transfer → retry with the same key (201, no second debit) →
+same key with a different body (422) → insufficient funds (422) → missing header (400) → balances and
+statement → `/actuator/env` (404). The jar was also started with `SPRINGDOC_APIDOCS_ENABLED=false` and
+`SPRINGDOC_SWAGGERUI_ENABLED=false`: both doc URLs returned 404. **Not verified:** the GitHub Actions
+workflow itself, because the repository has no GitHub remote yet. The first push will be its first run.
+
+### Thought process
+**Multi-stage build.**
+- Problem: building needs a JDK and Maven (hundreds of MB, plus a compiler an attacker could use).
+  Running needs only a JRE and the jar.
+- Chosen: stage 1 `eclipse-temurin:21-jdk` builds. Stage 2 `eclipse-temurin:21-jre` gets only the jar.
+  `pom.xml` and `.mvn` are copied and `dependency:go-offline` runs *before* `src` is copied, so the
+  dependency layer is cached and code-only changes rebuild quickly.
+- Not chosen: Alpine/distroless images (smaller, but Alpine uses musl and distroless has no shell or
+  curl for the health check), and Spring Boot layered jars or `bootBuildImage` (better layer caching, but
+  more to explain). The image is ~590 MB; that's the trade-off accepted for a familiar Ubuntu-based image.
+
+**Tests are not run inside `docker build`.** They need Docker themselves (Testcontainers), and Docker in
+Docker inside a build is fragile. CI runs `./mvnw verify` first, then builds the image, so no image is
+built from untested code in CI.
+
+**Non-root.** `useradd --system --uid 10001` with `USER app`. The jar is owned by root, so the app
+can't modify its own code. A fixed numeric uid is what Kubernetes `runAsNonRoot` and security scanners
+check for.
+
+**`-XX:MaxRAMPercentage=75`.** The JVM is container-aware, but by default it uses only 25% of the
+container's memory for the heap. In a 1 GB task that's 256 MB of heap and 750 MB unused.
+
+**Health check endpoint: Actuator.**
+- Problem: compose (and later the AWS load balancer) needs an HTTP URL that says "the app is up and can
+  reach its database".
+- Options: an existing endpoint like `/v3/api-docs` (but it's turned off in AWS), a TCP check (says
+  nothing about the DB), or Actuator.
+- Chosen: `spring-boot-starter-actuator` with exposure limited to `health`. The response is just
+  `{"status":"UP"}`, without component details, and it includes a database check. The trade-off is one
+  new dependency. It's an official Spring Boot module, so the parent pom manages its version.
+
+**Compose layout.** One file, two services. `depends_on: condition: service_healthy` delays the app
+until `pg_isready` passes, otherwise Flyway would fail on startup. Inside the compose network the app
+reaches the DB at `postgres:5432` (service name), while the host sees it at `127.0.0.1:${DB_PORT}`.
+For dev mode, `docker compose up -d postgres` starts only the database.
+
+**Mockito agent.** Since JDK 21, a library attaching an agent to the running JVM triggers a warning,
+and a future JDK will block it (JEP 451). `maven-dependency-plugin:properties` exposes the
+Mockito jar's path as `${org.mockito:mockito-core:jar}`, and Surefire passes `-javaagent:` with it.
+
+**CI.** `permissions: contents: read` (the default token can't push or comment), no secrets, Java 21
+with the Maven cache, `./mvnw -B verify`, then `docker build`. Actions are pinned to major versions
+(checkout v7, setup-java v6, checked against their latest releases on 2026-11-24). Pinning to commit
+SHAs would be stricter. Dependabot keeps them updated either way.
+
+**A bug found while setting up CI:** `mvnw` was committed with mode `100644`, not executable. It worked
+on Windows and in Docker Desktop (which marks every file executable), but `./mvnw` would fail on the
+Linux runner with "permission denied". Fixed with `git update-index --chmod=+x mvnw`.
+
+### Code walkthrough: the Dockerfile
+```dockerfile
+FROM eclipse-temurin:21-jdk AS build
+COPY mvnw pom.xml ./
+COPY .mvn .mvn
+RUN ./mvnw -B -q dependency:go-offline
+```
+Dependencies cached in their own layer. Copy `src` first and every code change re-downloads the internet.
+```dockerfile
+COPY src src
+RUN ./mvnw -B -q package -DskipTests
+```
+Builds the jar. `-DskipTests` because the tests ran in CI (see above).
+```dockerfile
+FROM eclipse-temurin:21-jre
+RUN groupadd --system --gid 10001 app && useradd --system --uid 10001 --gid app --no-create-home app
+COPY --from=build /workspace/target/contra-api-*.jar app.jar
+USER app
+```
+A fresh image: nothing from stage 1 except the jar. Remove `USER app` and the process runs as root.
+```dockerfile
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "app.jar"]
+```
+Exec form (JSON array), so `java` is PID 1 and receives `SIGTERM` directly on `docker stop`. Spring
+then shuts down gracefully. With the shell form, `sh` would be PID 1 and might not forward the signal.
+
+### What an interviewer would challenge
+- **"Why not run the tests in the Dockerfile?"** See above. The image is built from the same commit that
+  CI tested, and Testcontainers needs a Docker daemon, which a build step doesn't have by default.
+- **"How do secrets get into the container?"** As environment variables at runtime (compose reads
+  `.env`; in AWS, ECS injects them from Secrets Manager). Never as `ENV` in the Dockerfile or a copied
+  file: image layers are readable by anyone who can pull the image. `.dockerignore` excludes `.env` in
+  case of a careless `COPY . .`.
+- **"Liveness vs readiness?"** Our single health check includes the DB. As a *readiness* check that's
+  right (don't send traffic if the DB is down). As a *liveness* check it would restart healthy containers
+  during a DB outage. Boot provides `/actuator/health/liveness` and `/actuator/health/readiness` groups for
+  that split (already listed under `groups` in the health response). The AWS plan uses the main endpoint
+  for the load balancer only.
+- **"The image is 590 MB."** True. The options are JRE Alpine (~200 MB), distroless, or jlink a custom
+  runtime. Each saves pull time and attack surface but costs debuggability. This is listed as a possible
+  improvement, not done.
+- **"Is the CI workflow tested?"** Not yet. Honest answer: it's written to the documented action inputs,
+  and the same commands run locally, but the first real run happens on the first push.
+
+### Spring Boot 4 vs 3.x (seen in this stage)
+| | Boot 3.x | Boot 4.x |
+|---|---|---|
+| Actuator | `spring-boot-starter-actuator`, `management.endpoints.web.exposure.include` | same starter and properties, as far as this project uses them |
+| Mockito agent | same Surefire `-javaagent` approach | same; the self-attach warning comes from the JDK (21+), not from Boot |
+
+### Practice questions
+1. Why a multi-stage Dockerfile? What exactly ends up in the final image?
+   <details><summary>Answer</summary>The build needs a JDK, Maven and the source. Running needs only a
+   JRE and the jar. With two stages, the final image is the JRE base plus one `COPY --from=build` of the
+   jar: no compiler, no Maven, no source, no local Maven repository. It's smaller, has a smaller attack
+   surface, and secrets used only at build time can't leak through it.</details>
+2. Why run the container as a non-root user if it's isolated anyway?
+   <details><summary>Answer</summary>Container isolation isn't perfect: kernel or runtime bugs, mounted
+   volumes and misconfigured capabilities have all allowed escapes, and root in the container makes all of
+   them worse. As uid 10001 an exploited app can't install packages, change its own jar or bind
+   privileged ports. Many platforms (Kubernetes policies, scanners) also require it.</details>
+3. What does `depends_on: condition: service_healthy` solve, and what doesn't it solve?
+   <details><summary>Answer</summary>It delays starting the app until Postgres passes `pg_isready`, so
+   Flyway doesn't fail on a database that's still starting. It doesn't help if the database goes away
+   later, and it only works within one compose project. In ECS/Kubernetes the app must tolerate the DB
+   being unavailable (retries, a readiness check) instead.</details>
+4. How does CI make sure a Dependabot PR doesn't break the app?
+   <details><summary>Answer</summary>The workflow runs on every pull request: `./mvnw verify` runs all
+   67 tests (including Testcontainers and concurrency tests on real PostgreSQL) and then builds the image.
+   A PR that breaks either is red and shouldn't be merged. Branch protection requiring the check would
+   enforce that. It isn't configured, because there's no remote yet.</details>
+5. Why is the `ENTRYPOINT` in exec (JSON) form?
+   <details><summary>Answer</summary>So `java` is PID 1 and receives `SIGTERM` on `docker stop` or an ECS
+   task stop. Spring Boot then shuts down gracefully (finishes requests, closes the pool). In shell form,
+   `/bin/sh -c` is PID 1, may not forward signals, and the container is killed after the timeout.</details>

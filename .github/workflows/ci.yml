@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token: this workflow only builds and tests. No secrets are used.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # Unit, slice and Testcontainers tests. GitHub's Ubuntu runners have Docker, which Testcontainers needs.
+      - name: Build and test
+        run: ./mvnw -B verify
+
+      - name: Build the Docker image
+        run: docker build -t contra-api:ci .

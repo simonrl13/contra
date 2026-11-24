@@ -66,6 +66,15 @@ class ApplicationStartupTest {
 				.andExpect(jsonPath("$.info.title").exists());
 	}
 
+	@Test
+	void healthIsUpWithoutDetailsAndOtherActuatorEndpointsAreHidden() throws Exception {
+		mockMvc.perform(get("/actuator/health"))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.status").value("UP"))
+				.andExpect(jsonPath("$.components").doesNotExist());
+		mockMvc.perform(get("/actuator/env")).andExpect(status().isNotFound());
+	}
+
 	private boolean tableExists(String tableName) {
 		Integer count = jdbcTemplate.queryForObject(
 				"SELECT count(*) FROM information_schema.tables WHERE table_name = ?",

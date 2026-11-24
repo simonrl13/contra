@@ -1,5 +1,6 @@
-# Stage 1: database only. The app container is added in Stage 6.
-# Variables come from .env (compose reads it automatically).
+# Local stack: PostgreSQL 16 + the app. Variables come from .env (compose reads it automatically).
+#   Everything in Docker:     docker compose up -d --build --wait
+#   Database only (dev mode): docker compose up -d --wait postgres   then ./mvnw spring-boot:run
 services:
   postgres:
     image: postgres:16-alpine
@@ -17,6 +18,25 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  app:
+    build: .
+    environment:
+      # Inside the compose network the database is reachable by its service name, on its own port.
+      DB_URL: jdbc:postgresql://postgres:5432/contra
+      DB_USERNAME: ${DB_USERNAME:?set DB_USERNAME in .env}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy # start only once pg_isready succeeds, so Flyway can connect
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
 
 volumes:
   postgres-data:

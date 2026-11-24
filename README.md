@@ -3,7 +3,9 @@
 A REST API for bank accounts and money transfers between them: a double-entry ledger, idempotent
 transfers, and safe concurrent updates. Java 21, Spring Boot 4.1, PostgreSQL 16.
 
-> Work in progress. Done: setup, accounts, transfers with the ledger, idempotency, locking. Next: Docker and CI.
+A learning and portfolio project, not a production system: there is no authentication (see
+[SECURITY.md](SECURITY.md)). Study notes for every stage are in [NOTES.md](NOTES.md), and the AWS
+deployment plan is in [docs/aws.md](docs/aws.md) (prepared, not deployed).
 
 ## Requirements
 - JDK 21
@@ -12,19 +14,30 @@ transfers, and safe concurrent updates. Java 21, Spring Boot 4.1, PostgreSQL 16.
 Maven itself is not needed: the project ships the Maven wrapper (`./mvnw`, or `mvnw.cmd` on Windows).
 
 ## Run locally
+First `cp .env.example .env` and set your own `DB_PASSWORD`. Then either:
+
+**Everything in Docker** (app + PostgreSQL 16, both with health checks):
 ```bash
-cp .env.example .env          # then set your own DB_PASSWORD
-docker compose up -d --wait   # starts PostgreSQL 16 on localhost only
+docker compose up -d --build --wait
+```
+**Or the database in Docker and the app from your IDE/terminal:**
+```bash
+docker compose up -d --wait postgres
 ./mvnw spring-boot:run
 ```
 - Swagger UI: http://localhost:8080/swagger-ui.html
 - OpenAPI JSON: http://localhost:8080/v3/api-docs
+- Health: http://localhost:8080/actuator/health
 
 The app reads its database settings from `DB_URL`, `DB_USERNAME` and `DB_PASSWORD`. Locally they come
-from `.env`; anywhere else, set them as environment variables. If port 5432 is already in use, change
-`DB_PORT` and the port in `DB_URL` in `.env`.
+from `.env`; anywhere else, set them as environment variables. If port 5432 or 8080 is already in use,
+change `DB_PORT` (and the port in `DB_URL`) or `APP_PORT` in `.env`. Both ports are bound to
+`127.0.0.1` only.
 
-Stop the database with `docker compose down`. Add `-v` to also delete its data.
+Stop with `docker compose down`. Add `-v` to also delete the database data.
+
+The image is a multi-stage build: a JDK stage builds the jar, and the runtime stage has only the JRE
+and the jar, and runs as an unprivileged user (uid 10001).
 
 ## API examples
 Open an account. A non-zero initial deposit is recorded in the ledger as an `OPENING` entry.
@@ -75,9 +88,18 @@ A transfer that breaks a business rule is a 422 with a machine-readable `reason`
 ./mvnw verify
 ```
 The tests start a throwaway PostgreSQL 16 container, so Docker must be running. No `.env` is needed.
+They include unit tests, `@WebMvcTest` and `@DataJpaTest` slices, full-stack HTTP tests, and
+concurrency tests (200 transfers on 16 threads, races on one `Idempotency-Key`) against real PostgreSQL.
+
+CI (GitHub Actions, `.github/workflows/ci.yml`) runs `./mvnw verify` and builds the Docker image on every
+push to `main` and every pull request. Dependabot opens weekly update PRs for Maven, GitHub Actions and
+the Docker base images.
+
+Known build noise: Maven warns `Could not transfer metadata ... HTTP Status: 401` for two Redgate/Flyway
+repositories declared in Flyway's own pom. Nothing is downloaded from them, and the build is unaffected.
 
 ## Design decisions
-Filled in as each stage lands. Still to come: idempotency and the locking strategy.
+The reasoning behind each one (options, trade-offs, interview angles) is in [NOTES.md](NOTES.md).
 - **Money is `BigDecimal`, always 2 decimals.** `double` can't represent 0.10 exactly. Amounts with more
   than 2 decimals are rejected (400) rather than rounded: the API never silently changes a customer's
   number. The database uses `NUMERIC(19,2)`.
@@ -108,4 +130,7 @@ Filled in as each stage lands. Still to come: idempotency and the locking strate
   the schema but never changes it. Every schema change is a versioned SQL migration in `src/main/resources/db/migration`.
 - **Errors as ProblemDetail (RFC 9457).** Every error response is `application/problem+json` with
   `title`, `status`, `detail` and `instance`. `type` is left out because it's the default
-  `about:blank`. Validation errors add an `errors` map of field → message.
+  `about:blank`. Validation errors add an `errors` map of field (or header/parameter) → message.
+- **Config only from the environment.** No secrets in files that are committed or baked into the
+  image (`.env` is in both `.gitignore` and `.dockerignore`). A missing `DB_*` variable stops startup
+  with a one-line message naming it.

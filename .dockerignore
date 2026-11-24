@@ -1,0 +1,8 @@
+# Keep the build context small and secret-free: .env must never end up in an image layer.
+.env
+.git
+target
+.idea
+*.iml
+.vscode
+.claude

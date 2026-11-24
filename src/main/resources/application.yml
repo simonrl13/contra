@@ -19,3 +19,11 @@ spring:
     # Error messages in English whatever the server's or client's locale (this JVM defaults to pt_BR).
     locale: en
     locale-resolver: fixed
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Health only (also Boot's default; stated so nobody widens it by accident). It shows just
+        # {"status":"UP"}: no component details to anonymous callers. Includes a database check.
+        include: health

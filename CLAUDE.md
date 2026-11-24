@@ -8,7 +8,8 @@ Learning matters more than speed.
 - Java 21, Spring Boot 4.1.x (chosen over 4.0.x: 4.0 OSS support ends 2026-12-31), Maven via `./mvnw`
 - Spring Web MVC, Spring Data JPA, Bean Validation, PostgreSQL 16, Flyway (`ddl-auto: validate`, never `update`)
 - springdoc-openapi 3.x (Swagger UI at `/swagger-ui.html`)
-- Tests: JUnit 5, Mockito, AssertJ, `@WebMvcTest` / `@DataJpaTest` slices, Testcontainers (`postgres:16-alpine`)
+- Spring Boot Actuator (`/actuator/health` only, for health checks)
+- Tests: JUnit 5, Mockito (loaded as a `-javaagent` by Surefire), AssertJ, `@WebMvcTest` / `@DataJpaTest` slices, Testcontainers (`postgres:16-alpine`)
 
 ## Domain rules
 - Money is `BigDecimal`, scale 2, explicit `RoundingMode`. Never `double`. DB type `NUMERIC(19,2)`.
@@ -56,4 +57,7 @@ and reviews everything afterwards. The job is to make that review easy and compl
 8. Stage 7 (AWS) is preparation only: docs and config, no AWS resources created, no credentials asked for.
 
 ## Stages
+Done through Stage 6 (Docker: multi-stage, non-root; compose: app + postgres with health checks;
+CI: `.github/workflows/ci.yml`; Dependabot; Actuator `health` only). Stage 7 lives in `docs/aws.md`.
+
 1. Setup  2. Account  3. Transfer + ledger  4. Idempotency  5. Concurrency  6. Docker + CI + docs  7. AWS (plan only)

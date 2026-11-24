@@ -14,7 +14,9 @@ Learning matters more than speed.
 - Money is `BigDecimal`, scale 2, explicit `RoundingMode`. Never `double`. DB type `NUMERIC(19,2)`.
 - Transfer: amount > 0, different accounts, same currency (no FX), no negative balance. Atomic.
 - Double-entry ledger: entry types `OPENING`, `TRANSFER_DEBIT`, `TRANSFER_CREDIT`. An initial deposit is an
-  `OPENING` credit with no transfer. Invariant: for every account, sum of its entries = its balance.
+  `OPENING` credit with no transfer. Amounts are signed (debit < 0, credit > 0, enforced by CHECK
+  constraints). Invariant: for every account, `SUM(amount)` of its entries = its balance.
+- `common/Money.normalize` sets scale 2 with `RoundingMode.UNNECESSARY`; `@Digits(fraction = 2)` rejects more decimals.
 - `POST /transfers` requires `Idempotency-Key`. Same key + same payload returns the original result;
   same key + different payload returns 422.
 - Locks are taken in a consistent order (smaller UUID first) to avoid deadlocks.
@@ -22,7 +24,9 @@ Learning matters more than speed.
   409 concurrency conflict, 422 business rule broken.
 
 ## Code conventions
-- Package by feature: `account`, `transfer`, `common`. Controller → Service → Repository.
+- Package by feature: `account`, `ledger`, `transfer`, `common`. Controller → Service → Repository.
+- Entities reference other aggregates by id (UUID), not `@ManyToOne`.
+- API error messages are English (`spring.web.locale: en`, fixed resolver).
 - DTOs are Java records at the API boundary. Entities never leave the service layer.
 - Constructor injection only. `@Transactional` on service methods only.
 - Clear names, small methods, no clever tricks: code the owner could rewrite live under time pressure.

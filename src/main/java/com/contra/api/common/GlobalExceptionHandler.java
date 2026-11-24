@@ -1,6 +1,20 @@
 package com.contra.api.common;
 
+import java.util.Map;
+import java.util.TreeMap;
+
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.ProblemDetail;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.validation.FieldError;
+import tools.jackson.core.JacksonException;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
 /**
@@ -8,8 +22,45 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExcep
  *
  * Extending ResponseEntityExceptionHandler makes Spring MVC's own exceptions (validation failure,
  * malformed JSON, unknown route, wrong method...) return RFC 9457 ProblemDetail JSON.
- * Handlers for our domain exceptions (404, 409, 422) are added here in later stages.
+ * Domain exceptions stay HTTP-agnostic and are mapped to a status here.
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
+
+	@ExceptionHandler(NotFoundException.class)
+	ProblemDetail handleNotFound(NotFoundException exception) {
+		return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, exception.getMessage());
+	}
+
+	/** Bean Validation failure on a @Valid request body: 400, listing every invalid field. */
+	@Override
+	protected ResponseEntity<Object> handleMethodArgumentNotValid(MethodArgumentNotValidException exception,
+			HttpHeaders headers, HttpStatusCode status, WebRequest request) {
+		Map<String, String> errors = new TreeMap<>(); // sorted, so the response is stable
+		for (FieldError fieldError : exception.getBindingResult().getFieldErrors()) {
+			errors.put(fieldError.getField(), fieldError.getDefaultMessage());
+		}
+		return validationProblem(status, errors);
+	}
+
+	/**
+	 * Body that can't be turned into the request record: broken JSON, or a value of the wrong type
+	 * such as an unknown currency code. When Jackson knows which field failed, name it the same way
+	 * as a validation error. Jackson's own message isn't returned: it exposes internal class names.
+	 */
+	@Override
+	protected ResponseEntity<Object> handleHttpMessageNotReadable(HttpMessageNotReadableException exception,
+			HttpHeaders headers, HttpStatusCode status, WebRequest request) {
+		if (exception.getCause() instanceof JacksonException jacksonException && !jacksonException.getPath().isEmpty()) {
+			String field = jacksonException.getPath().getLast().getPropertyName();
+			return validationProblem(status, Map.of(field, "invalid value"));
+		}
+		return ResponseEntity.status(status).body(ProblemDetail.forStatusAndDetail(status, "Malformed JSON request"));
+	}
+
+	private ResponseEntity<Object> validationProblem(HttpStatusCode status, Map<String, String> errors) {
+		ProblemDetail problem = ProblemDetail.forStatusAndDetail(status, "Request validation failed");
+		problem.setProperty("errors", errors);
+		return ResponseEntity.status(status).body(problem);
+	}
 }

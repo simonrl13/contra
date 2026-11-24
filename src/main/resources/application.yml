@@ -15,3 +15,7 @@ spring:
       ddl-auto: validate
     # No lazy loading during JSON rendering: DB access stays inside the service layer's transactions.
     open-in-view: false
+  web:
+    # Error messages in English whatever the server's or client's locale (this JVM defaults to pt_BR).
+    locale: en
+    locale-resolver: fixed

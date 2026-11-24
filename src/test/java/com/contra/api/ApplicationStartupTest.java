@@ -41,9 +41,12 @@ class ApplicationStartupTest {
 	}
 
 	@Test
-	void flywayRanAndNothingIsPending() {
+	void flywayAppliedAllMigrations() {
 		assertThat(flyway.info().pending()).isEmpty();
-		assertThat(tableExists("flyway_schema_history")).isTrue();
+		assertThat(flyway.info().applied()).extracting(migration -> migration.getVersion().getVersion())
+				.containsExactly("1", "2");
+		assertThat(tableExists("accounts")).isTrue();
+		assertThat(tableExists("ledger_entries")).isTrue();
 	}
 
 	@Test

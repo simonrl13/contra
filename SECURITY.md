@@ -24,8 +24,9 @@ caller owns the source account.
 ## Threat model
 | Threat | Mitigation | Status |
 |---|---|---|
-| Malformed or hostile input | Bean Validation on request DTOs; errors returned as ProblemDetail without stack traces | Error format: Stage 1. Validation: Stages 2-3 |
-| SQL injection | JPA / parameterised queries only, no string-built SQL | Applies from Stage 2 |
+| Malformed or hostile input | Bean Validation on request DTOs (lengths, signs, at most 2 decimals, ISO currency); errors returned as ProblemDetail without stack traces or Jackson internals | Accounts: Stage 2. Transfers: Stage 3 |
+| SQL injection | JPA, Spring Data derived queries and parameterised JPQL only; no string-built SQL | Stage 2, re-checked each stage |
+| Invalid data reaching the DB through a bug | CHECK constraints: balance >= 0, debit/credit signs, ISO currency format | Stage 2 |
 | Double spending through retries | Required `Idempotency-Key` with a unique constraint; a key reused with a different payload is rejected (422) | Stage 4 |
 | Overdraft through concurrent requests | Row locking plus a `CHECK (balance >= 0)` constraint in the database | Stages 2 and 5 |
 | Idempotency key abuse (guessing or reusing someone else's key) | Keys are scoped to the request payload. Without authentication they can't be scoped per client, a known gap | Partial, Stage 4 |

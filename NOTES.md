@@ -51,3 +51,54 @@ against a real Postgres 16.
    could an H2-based test miss in a banking app?
 3. What is ProblemDetail, and how does a `@RestControllerAdvice` that extends
    `ResponseEntityExceptionHandler` change what a client sees for a malformed JSON body?
+
+---
+
+## Stage 2: Account
+
+**Built:** `POST /accounts` (201 + `Location`) and `GET /accounts/{id}`. Migrations `V1__accounts` and
+`V2__ledger_entries` with CHECK constraints. The `Account` and `LedgerEntry` entities, and
+`AccountService`, which writes the OPENING ledger entry in the same transaction as the account. 400 errors
+list each invalid field. Tests at every layer: Mockito unit, `@WebMvcTest`, `@DataJpaTest` on real
+Postgres, and one full-stack test.
+
+**Key concepts**
+- **Layers and DTOs.** The controller only does HTTP (status, headers, `@Valid`). The service owns the
+  transaction and the rules, and returns a record DTO, so the entity never reaches JSON. That keeps the
+  API contract separate from the table layout, and no lazy loading happens during serialisation.
+- **`@Transactional` on the service.** Account row + ledger row commit together or not at all. Reads
+  use `readOnly = true`, which tells Hibernate to skip dirty checking. It only works through the Spring
+  proxy, so calling a `@Transactional` method from inside the same class bypasses it.
+- **`@Version` (optimistic locking).** Hibernate updates with `WHERE id = ? AND version = ?`. If 0 rows
+  change, someone else updated first and it throws `OptimisticLockException`. It's a wrapper `Long`
+  because Spring Data's `save()` decides persist (insert) vs merge (select + update) by `version == null`
+  when the id is assigned by us. With a primitive `long` it would always merge.
+- **`BigDecimal`.** `equals` compares scale too (`100` ≠ `100.00`), `compareTo` doesn't. Hence
+  `isEqualByComparingTo` in tests, and normalising to scale 2 on the way in.
+- **Bean Validation.** `@NotBlank`, `@Size`, `@PositiveOrZero`, `@Digits(fraction = 2)` on the request
+  record, triggered by `@Valid` → `MethodArgumentNotValidException` → 400 with an `errors` map.
+- **Constraints in the DB as well as in Java.** Validation gives a nice 400. The CHECK constraint is the
+  guarantee: it holds whatever path the data takes (a bug, a manual SQL fix, a future second service).
+- **Test slices.** `@WebMvcTest` loads only MVC (fast, the service is a `@MockitoBean`). `@DataJpaTest`
+  loads only JPA, in a rolled-back transaction. `@SpringBootTest` loads everything. More slices means
+  faster, more focused failures.
+- **Entity design.** A protected no-arg constructor (JPA needs one), no setters, the UUID generated in
+  Java (known before insert), `@Enumerated(STRING)` (never ORDINAL: reordering the enum would corrupt
+  data), and ids instead of `@ManyToOne` (no lazy-loading or N+1 surprises).
+
+**Spring Boot 4 vs 3.x (seen in this stage)**
+| | Boot 3.x | Boot 4.x |
+|---|---|---|
+| Jackson | 2.x, `com.fasterxml.jackson` | 3.x, `tools.jackson` (annotations stay in `com.fasterxml.jackson.annotation`) |
+| `@WebMvcTest` | `o.s.boot.test.autoconfigure.web.servlet` | `o.s.boot.webmvc.test.autoconfigure` |
+| `@DataJpaTest` | `o.s.boot.test.autoconfigure.orm.jpa` | `o.s.boot.data.jpa.test.autoconfigure` |
+| `TestEntityManager` | `o.s.boot.test.autoconfigure.orm.jpa` | `o.s.boot.jpa.test.autoconfigure` |
+| Mocking a bean | `@MockBean` (deprecated since 3.4) | `@MockitoBean` from Spring Framework (`o.s.test.context.bean.override.mockito`) |
+
+**Practice questions**
+1. Why does `Account.version` use `Long` and not `long`? What would change in the SQL that Spring Data's
+   `save()` runs?
+2. The service already rejects negative balances. Why also have `CHECK (balance >= 0)` in the database?
+   What does each layer give you that the other doesn't?
+3. In a test, `new BigDecimal("100").equals(new BigDecimal("100.00"))` is false. Why, and how do you
+   compare money safely in Java and in AssertJ?

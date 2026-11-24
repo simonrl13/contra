@@ -397,7 +397,8 @@ double transfer; nothing in Java alone can prevent it without a lock.
    first is still running. The retry passes the lookup, does the transfer in memory, and its insert
    waits on the unique index until the first commits. Then it fails, rolls back, and returns 409. The
    client retries again and gets case 1. Case 3: the first failed or was rejected. Nothing was stored,
-   so the retry is evaluated as a new request.</details>
+   so the retry is evaluated as a new request. (Since Stage 5, case 2 for an identical request no longer
+   gets a 409: it waits on the account locks and then replays the committed transfer.)</details>
 2. Why can't `findByIdempotencyKey` alone guarantee at-most-once?
    <details><summary>Answer</summary>Check-then-act race: two transactions can both run the lookup
    before either commits, and both see nothing. Under READ COMMITTED (the PostgreSQL default) neither
@@ -418,3 +419,167 @@ double transfer; nothing in Java alone can prevent it without a lock.
    the unique constraint `(client_id, idempotency_key)`. The lookup becomes
    `findByClientIdAndIdempotencyKey`. Otherwise one client can reuse another's key and, if it knows
    the payload, read their transfer.</details>
+
+---
+
+## Stage 5: Concurrency
+
+### What we built
+`TransferService.transfer` now reads both accounts with `SELECT ... FOR UPDATE`
+(`@Lock(PESSIMISTIC_WRITE)` on `AccountRepository.findByIdForUpdate`), always locking the smaller UUID
+first. The idempotency lookup moved to *after* the locks, so a concurrent duplicate of the same request
+waits and then replays the original instead of getting a 409. Any database lock or version conflict that
+still escapes (`ConcurrencyFailureException`) becomes a 409 instead of a 500. A concurrency test runs
+200 random transfers on 16 threads, released together by a `CountDownLatch`, against real Postgres.
+
+### Thought process
+**The problem: lost updates.**
+Two transfers out of account A (balance 100) run at once. Both read 100, both check "100 ≥ 60", and both
+write `100 - 60 = 40`. One debit is lost, or with stricter checks the balance goes negative. It's the
+classic read-modify-write race: the check and the write are not atomic with respect to each other.
+
+**Options considered**
+| | Pessimistic (`FOR UPDATE`) | Optimistic (`@Version` + retry) | Atomic SQL (`UPDATE ... SET balance = balance - ? WHERE balance >= ?`) | `SERIALIZABLE` isolation |
+|---|---|---|---|---|
+| How | Lock the rows when reading; others wait | Read freely; the `UPDATE ... WHERE version = ?` fails if someone changed the row; retry | Let one statement do check + write | Postgres aborts transactions that would be non-serialisable |
+| On contention | Requests queue, all succeed | Losers fail and must retry (retry storms on hot accounts) | Fine for one row | Losers fail and must retry |
+| Deadlocks | Possible, prevented by lock ordering | None | Possible with two rows unless ordered | Not deadlocks, but serialisation failures |
+| Code | One annotation + ordering | Retry loop outside the transaction, backoff, max attempts | Custom queries; the entity no longer owns the rule | A config change, plus a retry loop |
+
+- Chosen: **pessimistic locking**. For money movement it's deterministic: every request gets an answer
+  without a retry loop, the balance check runs on a value nobody else can change until commit, and
+  `SELECT ... FOR UPDATE` is what most banking systems people will recognise.
+- Rejected: **optimistic + retry**. It's better when conflicts are rare and reads dominate, and it
+  holds no DB locks while the application thinks. But a hot account (a merchant receiving many payments)
+  turns into repeated failures and retries, and the retry must sit *outside* the transaction (a new
+  transaction per attempt). That's more moving parts to get wrong. `@Version` stays on `Account` as a
+  safety net: an update path that forgets the lock fails loudly instead of losing money.
+- Trade-off accepted: throughput on one account is serialised (one transfer at a time per account),
+  and a slow transaction holding a lock makes others wait. Transactions here are a few milliseconds
+  and touch two rows, so that's fine at this scale.
+
+**Lock ordering (deadlock prevention).**
+- Problem: T1 is A→B and locks A, T2 is B→A and locks B. T1 waits for B, T2 waits for A: deadlock.
+  Postgres detects it after `deadlock_timeout` (1 s by default) and kills one transaction.
+- Chosen: always lock the smaller UUID first, whatever the direction. Both transactions then ask for
+  the same first row: one gets it, the other waits, and there's no cycle.
+- The order is Java's `UUID.compareTo`. It isn't the same as Postgres's uuid ordering, but it doesn't
+  need to be: it only has to be the same rule in every code path that locks more than one account.
+
+**Lookup after the locks.**
+In Stage 4 the key lookup ran first, so two identical concurrent requests both passed it and the loser
+got a 409. Now the lookup runs after both rows are locked. An identical duplicate locks the same rows,
+so it waits until the first transfer commits. Its lookup (a new statement under READ COMMITTED) then
+sees the committed transfer and replays it. The unique constraint is still the guarantee for the
+remaining case: same key, *different* accounts.
+
+**Proving the test has teeth.** A concurrency test that passes proves little unless it fails without
+the fix. This was checked by hand with two temporary edits that were then reverted:
+1. `findByIdForUpdate` → `findById` (no lock): the test fails with `ObjectOptimisticLockingFailureException`
+   ("expected row count 1 but was 0"). That's `@Version` catching the lost updates.
+2. Locks without ordering (always source first): the test fails, with Postgres reporting `deadlock detected`
+   and Spring throwing `CannotAcquireLockException`.
+
+A lesson from this check: restoring the original file with PowerShell's `Copy-Item` kept its *old*
+timestamp, so Maven's incremental compiler thought the mutated class was still up to date, and the next
+full build deadlocked. `./mvnw clean verify` fixed it. When a result makes no sense, rule out a stale
+build before debugging the code.
+
+### Code walkthrough: locking in `TransferService`
+```java
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("SELECT a FROM Account a WHERE a.id = :id")
+Optional<Account> findByIdForUpdate(UUID id);
+```
+On PostgreSQL, Hibernate 7 turns `PESSIMISTIC_WRITE` into `select ... for no key update` (seen in the
+SQL log). That's a slightly weaker row lock than `FOR UPDATE`: it still blocks every other writer and
+locker of the row, but not the `FOR KEY SHARE` locks that foreign-key checks take when another table
+inserts a row referencing this account. Since we never change an account's id, that's exactly enough,
+and it means fewer waits. The lock lasts until
+the transaction commits or rolls back, which is why this must run inside `@Transactional`. Without a
+transaction, the lock would be released at once (autocommit).
+```java
+if (amount.signum() <= 0) ... ; if (from.equals(to)) ...
+```
+The stateless checks stay *before* the locks: no point locking rows for a request that's invalid anyway.
+```java
+LockedAccounts accounts = lockBothAccounts(request.fromAccountId(), request.toAccountId());
+```
+```java
+private LockedAccounts lockBothAccounts(UUID sourceId, UUID targetId) {
+    if (sourceId.compareTo(targetId) < 0) {
+        Account source = lockAccount(sourceId);
+        return new LockedAccounts(source, lockAccount(targetId));
+    }
+    Account target = lockAccount(targetId);
+    return new LockedAccounts(lockAccount(sourceId), target);
+}
+```
+The two branches differ only in which row is locked first. The small record keeps "which one is the
+source" separate from "which one was locked first". Remove the ordering and opposite-direction transfers
+deadlock (verified above). Remove the locks and you're back to lost updates (verified above).
+```java
+Optional<Transfer> earlier = transferRepository.findByIdempotencyKey(idempotencyKey);
+```
+Now after the locks (see above). Then come the currency and funds checks, on balances that nobody else
+can change until we commit: that's the whole point. The balance check is only correct *because* it runs
+on a locked row.
+
+### What an interviewer would challenge
+- **"Why not optimistic locking?"** See the table. Short version: under contention it fails instead
+  of waiting, so it needs a retry loop outside the transaction, and hot accounts cause retry storms.
+  Pessimistic locking queues requests and answers each one deterministically. Optimistic locking is the
+  better fit for low-contention, read-heavy data (user profiles, settings).
+- **"How does this scale?"** Per account, transfers are serialised: throughput is bounded by
+  transaction time (a few ms → hundreds per second per account). Different account pairs run in
+  parallel. Beyond that: keep transactions short (no HTTP calls inside them), use a bigger connection
+  pool and more instances (locks live in Postgres, so this works across instances), and for very hot
+  accounts consider sub-accounts or queueing transfers per account.
+- **"What if a transaction holds the lock and hangs?"** Others wait. Mitigations not implemented
+  here: `lock_timeout` or the JPA hint `jakarta.persistence.lock.timeout`, so waiters fail fast with a
+  409 (already mapped via `ConcurrencyFailureException`), plus `idle_in_transaction_session_timeout`
+  on the database.
+- **"Does it work with several app instances?"** Yes. The locks are rows in PostgreSQL, not Java
+  monitors, so every instance shares them. A `synchronized` block would only protect one JVM.
+- **"Isolation level?"** The default READ COMMITTED. `FOR UPDATE` returns the latest committed version
+  of the row after waiting, so the check runs on fresh data. REPEATABLE READ would instead fail the
+  waiter with a serialisation error.
+- **"Why keep `@Version` if you lock?"** Defence in depth. Any future code that updates an account
+  without locking gets an optimistic-lock failure (409) instead of silently overwriting a balance.
+- **"How do you know there are no deadlocks?"** The test runs opposite-direction transfers on 4
+  accounts with 16 threads and expects zero unexpected exceptions, and it fails when the ordering is
+  removed. That shows the ordering works for this code path. It doesn't prove the absence of deadlocks
+  in future code, which is why the rule is in CLAUDE.md.
+
+### Spring Boot 4 vs 3.x (seen in this stage)
+Nothing new: `@Lock`, `LockModeType` (`jakarta.persistence`) and `ConcurrencyFailureException` are
+the same as in Boot 3.x. `ExecutorService` in try-with-resources (Java 19+) is a Java feature, not a
+Boot one: `close()` waits for the submitted tasks to finish.
+
+### Practice questions
+1. Explain a lost update and how `SELECT ... FOR UPDATE` prevents it.
+   <details><summary>Answer</summary>Two transactions read the same balance, compute new values
+   independently and write them. The second write overwrites the first, so one debit disappears.
+   `FOR UPDATE` locks the row at read time: the second transaction's read blocks until the first commits,
+   then returns the updated balance, so its check and its write are based on current data.</details>
+2. How can two transfers deadlock, and how does the code prevent it?
+   <details><summary>Answer</summary>A→B locks A then waits for B, while B→A locks B then waits for A.
+   Each waits for the other forever, until Postgres detects the cycle and aborts one. The code always
+   locks the smaller UUID first, whatever the direction, so both transactions request the same row first.
+   One waits behind the other, and no cycle can form.</details>
+3. When would you choose optimistic locking instead?
+   <details><summary>Answer</summary>When conflicts are rare, reads dominate, and a failed attempt is
+   cheap to retry or can be shown to the user ("someone else edited this, reload"). For example,
+   editing a profile, or long user "think time" between read and write, where holding a DB lock would be
+   unacceptable. For hot money movement, pessimistic locking avoids retry storms.</details>
+4. Why does the concurrency test use a `CountDownLatch`, and what does it assert?
+   <details><summary>Answer</summary>Without a start gate, threads start one by one and may barely
+   overlap, so the race rarely happens. All tasks wait on `startGate.await()`, and `countDown()`
+   releases them together. It asserts: no exception except INSUFFICIENT_FUNDS, some transfers succeed
+   and some are rejected, no balance below zero, the total across accounts unchanged (400.00), and for
+   every account, sum of ledger entries = balance.</details>
+5. The idempotency lookup moved after the locks. What does that change for two identical concurrent requests?
+   <details><summary>Answer</summary>Before, both passed the lookup, both did the transfer, and the
+   unique constraint failed the second (409). Now the second blocks on the account lock until the first
+   commits. Its lookup then sees the committed transfer and replays it, so both clients get 201 with the
+   same transfer. The constraint still covers same-key requests on different accounts.</details>

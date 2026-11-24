@@ -11,6 +11,7 @@ import com.contra.api.transfer.TransferRejectedException.Reason;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
@@ -121,6 +122,16 @@ class TransferControllerTest {
 				.contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
 				.andExpect(status().isConflict())
 				.andExpect(jsonPath("$.detail").value("processed concurrently"));
+	}
+
+	@Test
+	void databaseLockConflictReturns409() throws Exception {
+		when(transferService.transfer(any(), any())).thenThrow(new CannotAcquireLockException("deadlock detected"));
+
+		mockMvc.perform(post("/transfers").header("Idempotency-Key", KEY)
+				.contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+				.andExpect(status().isConflict())
+				.andExpect(jsonPath("$.detail").value("Concurrent update conflict. Retry the request."));
 	}
 
 	@Test

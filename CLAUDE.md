@@ -28,7 +28,10 @@ Learning matters more than speed.
 - Balance changes go through `Account.debit/credit` (guards only). Ledger entries for transfers come from
   `LedgerEntry.transferDebit/transferCredit`, which set the sign. Business rejections are
   `TransferRejectedException(Reason)` → 422 with a `reason` property.
-- Migrations so far: V1 accounts, V2 ledger_entries, V3 transfers (+ FK ledger_entries.transfer_id).
+- Migrations so far: V1 accounts, V2 ledger_entries, V3 transfers (+ FK ledger_entries.transfer_id),
+  V4 idempotency_key (unique) + request_hash on transfers.
+- Transfers lock both accounts with `AccountRepository.findByIdForUpdate`, smaller UUID first, and look up
+  the Idempotency-Key only after locking. 409: `ConflictException` or any `ConcurrencyFailureException`.
 - Entities reference other aggregates by id (UUID), not `@ManyToOne`.
 - API error messages are English (`spring.web.locale: en`, fixed resolver).
 - DTOs are Java records at the API boundary. Entities never leave the service layer.

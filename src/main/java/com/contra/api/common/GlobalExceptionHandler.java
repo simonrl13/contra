@@ -7,6 +7,7 @@ import com.contra.api.transfer.TransferRejectedException;
 
 import org.springframework.context.MessageSourceResolvable;
 import org.springframework.core.MethodParameter;
+import org.springframework.dao.ConcurrencyFailureException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -43,6 +44,16 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 	@ExceptionHandler(ConflictException.class)
 	ProblemDetail handleConflict(ConflictException exception) {
 		return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, exception.getMessage());
+	}
+
+	/**
+	 * A lock or version conflict from the database (optimistic lock failure, lock timeout, deadlock).
+	 * Transfers lock in a fixed order so this shouldn't happen, but if it does the right answer is
+	 * "conflict, retry", not a 500.
+	 */
+	@ExceptionHandler(ConcurrencyFailureException.class)
+	ProblemDetail handleConcurrencyFailure(ConcurrencyFailureException exception) {
+		return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, "Concurrent update conflict. Retry the request.");
 	}
 
 	/** Well-formed request that breaks a business rule: 422, with a machine-readable reason. */

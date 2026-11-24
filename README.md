@@ -3,7 +3,7 @@
 A REST API for bank accounts and money transfers between them: a double-entry ledger, idempotent
 transfers, and safe concurrent updates. Java 21, Spring Boot 4.1, PostgreSQL 16.
 
-> Work in progress. Done: setup, accounts, transfers with the ledger, idempotency. Next: locking.
+> Work in progress. Done: setup, accounts, transfers with the ledger, idempotency, locking. Next: Docker and CI.
 
 ## Requirements
 - JDK 21
@@ -67,7 +67,7 @@ A transfer that breaks a business rule is a 422 with a machine-readable `reason`
 |---|---|
 | 400 | Invalid field, more than 2 decimals, unknown currency code, malformed JSON or id, bad page/size |
 | 404 | Unknown account or transfer |
-| 409 | Another request with the same `Idempotency-Key` was being processed at the same moment; retry |
+| 409 | Another request with the same `Idempotency-Key` (and different accounts) was processed at the same moment, or a database lock conflict; retry |
 | 422 | Transfer breaks a business rule, or the `Idempotency-Key` was already used for a different request (see `reason`) |
 
 ## Run the tests
@@ -94,6 +94,12 @@ Filled in as each stage lands. Still to come: idempotency and the locking strate
   columns on `transfers`, with a `UNIQUE` constraint on the key. The lookup catches ordinary retries;
   the constraint catches two requests racing with the same key (the loser rolls back and gets 409).
   Only completed transfers are stored, so a rejected request doesn't use up its key.
+- **Pessimistic locking, smaller id first.** A transfer reads both accounts with `SELECT ... FOR UPDATE`,
+  always locking the smaller UUID first, so concurrent transfers queue instead of losing updates, and
+  A→B / B→A can't deadlock. Optimistic locking with retries was rejected: under contention it fails
+  instead of waiting and needs a retry loop. `@Version` stays on `Account` as a safety net. A test runs
+  200 concurrent transfers on 16 threads and checks that no balance goes negative, the total is unchanged,
+  and every ledger matches its balance. It fails if the locks or the ordering are removed (checked by hand).
 - **Constraints in the database too.** `CHECK (balance >= 0)`, a debit must be negative, and a credit
   must be positive. The service enforces these rules, and the database stops any bug that gets past it.
 - **Currency is `java.util.Currency`.** Unknown ISO codes are rejected while the JSON is parsed. Known

@@ -43,16 +43,14 @@ public class TransferService {
 	 * Moves money from one account to another, atomically and at most once per Idempotency-Key.
 	 * Every check runs before anything changes, and one transaction covers both balances, the
 	 * transfer row and both ledger entries.
+	 *
+	 * Concurrency: both account rows are locked (SELECT ... FOR UPDATE) before the balance is read,
+	 * smaller id first, and stay locked until commit. See lockBothAccounts.
 	 */
 	@Transactional
 	public TransferResponse transfer(String idempotencyKey, TransferRequest request) {
 		BigDecimal amount = Money.normalize(request.amount());
 		String requestHash = requestHash(request, amount);
-
-		Optional<Transfer> earlier = transferRepository.findByIdempotencyKey(idempotencyKey);
-		if (earlier.isPresent()) {
-			return replay(earlier.get(), requestHash);
-		}
 
 		if (amount.signum() <= 0) {
 			throw new TransferRejectedException(Reason.AMOUNT_NOT_POSITIVE);
@@ -61,8 +59,16 @@ public class TransferService {
 			throw new TransferRejectedException(Reason.SAME_ACCOUNT);
 		}
 
-		Account source = findAccount(request.fromAccountId());
-		Account target = findAccount(request.toAccountId());
+		LockedAccounts accounts = lockBothAccounts(request.fromAccountId(), request.toAccountId());
+		Account source = accounts.source();
+		Account target = accounts.target();
+
+		// Looked up only after the locks: a duplicate of a transfer still in flight on the same accounts
+		// waits for it to commit, then finds it here and replays it instead of failing with a 409.
+		Optional<Transfer> earlier = transferRepository.findByIdempotencyKey(idempotencyKey);
+		if (earlier.isPresent()) {
+			return replay(earlier.get(), requestHash);
+		}
 
 		if (!source.getCurrency().equals(request.currency()) || !target.getCurrency().equals(request.currency())) {
 			throw new TransferRejectedException(Reason.CURRENCY_MISMATCH);
@@ -128,8 +134,27 @@ public class TransferService {
 		}
 	}
 
-	private Account findAccount(UUID id) {
-		return accountRepository.findById(id).orElseThrow(() -> new NotFoundException("Account", id));
+	private record LockedAccounts(Account source, Account target) {
+	}
+
+	/**
+	 * Locks both rows in one global order, smaller UUID first, whichever is source or target.
+	 * Without a fixed order, A→B locking A then B while B→A locks B then A can deadlock: each holds
+	 * one row and waits for the other. With a fixed order, both transfers ask for the same row first,
+	 * so one simply waits for the other. The order only has to be the same everywhere in this
+	 * application; Java's UUID.compareTo is used consistently.
+	 */
+	private LockedAccounts lockBothAccounts(UUID sourceId, UUID targetId) {
+		if (sourceId.compareTo(targetId) < 0) {
+			Account source = lockAccount(sourceId);
+			return new LockedAccounts(source, lockAccount(targetId));
+		}
+		Account target = lockAccount(targetId);
+		return new LockedAccounts(lockAccount(sourceId), target);
+	}
+
+	private Account lockAccount(UUID id) {
+		return accountRepository.findByIdForUpdate(id).orElseThrow(() -> new NotFoundException("Account", id));
 	}
 
 	@Transactional(readOnly = true)

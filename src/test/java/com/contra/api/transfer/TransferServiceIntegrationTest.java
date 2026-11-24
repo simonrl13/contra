@@ -4,6 +4,7 @@ import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Currency;
 import java.util.List;
+import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -11,6 +12,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.function.IntFunction;
 
 import com.contra.api.TestcontainersConfiguration;
 import com.contra.api.account.AccountRepository;
@@ -251,48 +253,141 @@ class TransferServiceIntegrationTest {
 	}
 
 	/**
-	 * The race: several requests with the same key start at the same instant, so all of them can pass
-	 * the "seen this key?" lookup before any has committed. The unique constraint lets exactly one
-	 * insert win. Each loser either sees the winner's transfer (if it looked after the commit) or gets
-	 * a ConflictException (409). Money moves once.
+	 * The race: several identical requests with the same key start at the same instant. They all lock the
+	 * same two accounts, so they run one after another, and each one after the first finds the committed
+	 * transfer and replays it. Money moves once, and nobody gets an error.
 	 */
 	@Test
-	void concurrentRequestsWithTheSameKeyMoveMoneyOnce() throws Exception {
+	void concurrentIdenticalRequestsWithTheSameKeyMoveMoneyOnceAndAllGetTheSameTransfer() throws Exception {
 		UUID ana = open(EUR, "100.00");
 		UUID bob = open(EUR, "0");
 		String key = newKey();
 		TransferRequest request = request(ana, bob, "30.00", EUR);
-		int threads = 8;
 
-		List<UUID> returnedIds = new ArrayList<>();
-		int conflicts = 0;
-		CountDownLatch startGate = new CountDownLatch(1);
-		try (ExecutorService pool = Executors.newFixedThreadPool(threads)) {
-			List<Future<TransferResponse>> results = new ArrayList<>();
-			for (int i = 0; i < threads; i++) {
-				results.add(pool.submit(() -> {
-					startGate.await();
-					return transferService.transfer(key, request);
-				}));
-			}
-			startGate.countDown();
-			for (Future<TransferResponse> result : results) {
-				try {
-					returnedIds.add(result.get(30, TimeUnit.SECONDS).id());
-				} catch (ExecutionException failure) {
-					assertThat(failure.getCause()).isInstanceOf(ConflictException.class);
-					conflicts++;
-				}
-			}
-		}
+		List<Outcome> outcomes = runConcurrently(8, i -> transferService.transfer(key, request));
 
-		assertThat(returnedIds).isNotEmpty();
-		assertThat(returnedIds).containsOnly(returnedIds.getFirst());
-		assertThat(returnedIds.size() + conflicts).isEqualTo(threads);
+		assertThat(outcomes).allSatisfy(outcome -> assertThat(outcome.failure()).isNull());
+		assertThat(outcomes).extracting(outcome -> outcome.transfer().id())
+				.containsOnly(outcomes.getFirst().transfer().id());
 		assertThat(balanceOf(ana)).isEqualTo(new BigDecimal("70.00"));
 		assertThat(balanceOf(bob)).isEqualTo(new BigDecimal("30.00"));
 		assertLedgerMatchesBalance(ana);
 		assertLedgerMatchesBalance(bob);
+	}
+
+	/**
+	 * Same key, different requests (each to another target account), started together. They don't
+	 * share all their locks, so several can pass the key lookup; the unique constraint lets exactly one
+	 * insert win. Each loser gets a 409 (it raced) or IDEMPOTENCY_KEY_REUSED (it looked after the commit).
+	 */
+	@Test
+	void concurrentDifferentRequestsWithTheSameKeyMoveMoneyOnce() throws Exception {
+		UUID ana = open(EUR, "100.00");
+		List<UUID> targets = new ArrayList<>();
+		for (int i = 0; i < 8; i++) {
+			targets.add(open(EUR, "0"));
+		}
+		String key = newKey();
+
+		List<Outcome> outcomes = runConcurrently(targets.size(),
+				i -> transferService.transfer(key, request(ana, targets.get(i), "30.00", EUR)));
+
+		assertThat(outcomes).filteredOn(outcome -> outcome.failure() == null).hasSize(1);
+		assertThat(outcomes).filteredOn(outcome -> outcome.failure() != null)
+				.allSatisfy(outcome -> assertThat(isConflictOrKeyReused(outcome.failure())).isTrue());
+		assertThat(balanceOf(ana)).isEqualTo(new BigDecimal("70.00"));
+		assertThat(targets.stream().map(this::balanceOf).reduce(BigDecimal.ZERO, BigDecimal::add))
+				.isEqualTo(new BigDecimal("30.00"));
+	}
+
+	private static boolean isConflictOrKeyReused(Throwable failure) {
+		return failure instanceof ConflictException
+				|| failure instanceof TransferRejectedException rejected && rejected.getReason() == Reason.IDEMPOTENCY_KEY_REUSED;
+	}
+
+	// --- concurrency ---
+
+	/**
+	 * Many transfers between a few accounts, in both directions, all released at once by a start gate.
+	 * Without row locks, concurrent read-modify-write on a balance either loses an update or (with
+	 * @Version) fails with an optimistic-lock error. Without lock ordering, A→B and B→A deadlock.
+	 * Either way an unexpected exception shows up here. Allowed outcomes: success or INSUFFICIENT_FUNDS.
+	 */
+	@Test
+	void concurrentTransfersKeepEveryInvariant() throws Exception {
+		List<UUID> accounts = new ArrayList<>();
+		for (int i = 0; i < 4; i++) {
+			accounts.add(open(EUR, "100.00"));
+		}
+		BigDecimal totalBefore = new BigDecimal("400.00");
+		int transfers = 200;
+		Random random = new Random(42); // fixed seed: the same transfers on every run
+		List<TransferRequest> requests = new ArrayList<>();
+		for (int i = 0; i < transfers; i++) {
+			int from = random.nextInt(accounts.size());
+			int to = (from + 1 + random.nextInt(accounts.size() - 1)) % accounts.size();
+			BigDecimal amount = BigDecimal.valueOf(100 + random.nextInt(6000), 2); // 1.00 to 60.99
+			requests.add(new TransferRequest(accounts.get(from), accounts.get(to), amount, EUR));
+		}
+
+		List<Outcome> outcomes = runConcurrently(transfers, 16, i -> transferService.transfer(newKey(), requests.get(i)));
+
+		List<Throwable> unexpected = outcomes.stream()
+				.map(Outcome::failure)
+				.filter(failure -> failure != null && !isInsufficientFunds(failure))
+				.toList();
+		assertThat(unexpected).isEmpty();
+		assertThat(outcomes).filteredOn(outcome -> outcome.failure() == null).isNotEmpty();
+		assertThat(outcomes).filteredOn(outcome -> outcome.failure() != null).isNotEmpty(); // funds really ran out
+
+		BigDecimal totalAfter = BigDecimal.ZERO;
+		for (UUID account : accounts) {
+			assertThat(balanceOf(account)).isGreaterThanOrEqualTo(BigDecimal.ZERO);
+			assertLedgerMatchesBalance(account);
+			totalAfter = totalAfter.add(balanceOf(account));
+		}
+		assertThat(totalAfter).isEqualTo(totalBefore);
+	}
+
+	private static boolean isInsufficientFunds(Throwable failure) {
+		return failure instanceof TransferRejectedException rejected && rejected.getReason() == Reason.INSUFFICIENT_FUNDS;
+	}
+
+	/** The result of one concurrent call: a transfer, or the exception it threw. */
+	private record Outcome(TransferResponse transfer, Throwable failure) {
+	}
+
+	private List<Outcome> runConcurrently(int calls, IntFunction<TransferResponse> call) throws Exception {
+		return runConcurrently(calls, calls, call);
+	}
+
+	/**
+	 * Runs the calls on a thread pool, all waiting on one start gate, so they hit the database at the
+	 * same moment instead of one by one as the threads happen to start.
+	 */
+	private List<Outcome> runConcurrently(int calls, int threads, IntFunction<TransferResponse> call) throws Exception {
+		CountDownLatch startGate = new CountDownLatch(1);
+		List<Future<TransferResponse>> futures = new ArrayList<>();
+		try (ExecutorService pool = Executors.newFixedThreadPool(threads)) {
+			for (int i = 0; i < calls; i++) {
+				int index = i;
+				futures.add(pool.submit(() -> {
+					startGate.await();
+					return call.apply(index);
+				}));
+			}
+			startGate.countDown();
+
+			List<Outcome> outcomes = new ArrayList<>();
+			for (Future<TransferResponse> future : futures) {
+				try {
+					outcomes.add(new Outcome(future.get(60, TimeUnit.SECONDS), null));
+				} catch (ExecutionException failure) {
+					outcomes.add(new Outcome(null, failure.getCause()));
+				}
+			}
+			return outcomes;
+		}
 	}
 
 	// --- helpers ---

@@ -145,7 +145,8 @@ class AccountControllerTest {
 	void transactionsRejectsPageSizeAbove100() throws Exception {
 		mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_ID).param("size", "101"))
 				.andExpect(status().isBadRequest())
-				.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON));
+				.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
+				.andExpect(jsonPath("$.errors.size").value("must be less than or equal to 100"));
 
 		verifyNoInteractions(accountService);
 	}

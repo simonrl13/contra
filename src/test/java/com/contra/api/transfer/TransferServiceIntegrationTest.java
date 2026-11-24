@@ -1,14 +1,22 @@
 package com.contra.api.transfer;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.Currency;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import com.contra.api.TestcontainersConfiguration;
 import com.contra.api.account.AccountRepository;
 import com.contra.api.account.AccountService;
 import com.contra.api.account.OpenAccountRequest;
+import com.contra.api.common.ConflictException;
 import com.contra.api.common.NotFoundException;
 import com.contra.api.ledger.LedgerEntry;
 import com.contra.api.ledger.LedgerEntryRepository;
@@ -64,7 +72,7 @@ class TransferServiceIntegrationTest {
 		UUID ana = open(EUR, "100.00");
 		UUID bob = open(EUR, "5.00");
 
-		TransferResponse transfer = transferService.transfer(request(ana, bob, "30", EUR));
+		TransferResponse transfer = transferService.transfer(newKey(), request(ana, bob, "30", EUR));
 
 		assertThat(transfer.fromAccountId()).isEqualTo(ana);
 		assertThat(transfer.toAccountId()).isEqualTo(bob);
@@ -90,7 +98,7 @@ class TransferServiceIntegrationTest {
 		UUID ana = open(EUR, "30.00");
 		UUID bob = open(EUR, "0");
 
-		transferService.transfer(request(ana, bob, "30.00", EUR));
+		transferService.transfer(newKey(), request(ana, bob, "30.00", EUR));
 
 		assertThat(balanceOf(ana)).isEqualTo(new BigDecimal("0.00"));
 		assertThat(balanceOf(bob)).isEqualTo(new BigDecimal("30.00"));
@@ -158,7 +166,7 @@ class TransferServiceIntegrationTest {
 		UUID unknown = UUID.randomUUID();
 		UUID bob = open(EUR, "0");
 
-		assertThatThrownBy(() -> transferService.transfer(request(unknown, bob, "1.00", EUR)))
+		assertThatThrownBy(() -> transferService.transfer(newKey(), request(unknown, bob, "1.00", EUR)))
 				.isInstanceOf(NotFoundException.class)
 				.hasMessage("Account " + unknown + " not found");
 	}
@@ -168,7 +176,7 @@ class TransferServiceIntegrationTest {
 		UUID ana = open(EUR, "10.00");
 		UUID unknown = UUID.randomUUID();
 
-		assertThatThrownBy(() -> transferService.transfer(request(ana, unknown, "1.00", EUR)))
+		assertThatThrownBy(() -> transferService.transfer(newKey(), request(ana, unknown, "1.00", EUR)))
 				.isInstanceOf(NotFoundException.class)
 				.hasMessage("Account " + unknown + " not found");
 
@@ -192,7 +200,7 @@ class TransferServiceIntegrationTest {
 		doThrow(ledgerFailure).when(ledgerEntryRepository).saveAll(any());
 		doThrow(ledgerFailure).when(ledgerEntryRepository).saveAllAndFlush(any());
 
-		assertThatThrownBy(() -> transferService.transfer(request(ana, bob, "30.00", EUR)))
+		assertThatThrownBy(() -> transferService.transfer(newKey(), request(ana, bob, "30.00", EUR)))
 				.isSameAs(ledgerFailure);
 
 		assertThat(balanceOf(ana)).isEqualTo(new BigDecimal("100.00"));
@@ -200,10 +208,101 @@ class TransferServiceIntegrationTest {
 		assertThat(transferRepository.count()).isEqualTo(transfersBefore);
 	}
 
+	// --- idempotency ---
+
+	@Test
+	void sameKeyAndSameRequestReturnsTheOriginalTransferAndMovesMoneyOnce() {
+		UUID ana = open(EUR, "100.00");
+		UUID bob = open(EUR, "0");
+		String key = newKey();
+
+		TransferResponse first = transferService.transfer(key, request(ana, bob, "30", EUR));
+		TransferResponse retry = transferService.transfer(key, request(ana, bob, "30.00", EUR));
+
+		assertThat(retry).isEqualTo(first);
+		assertThat(balanceOf(ana)).isEqualTo(new BigDecimal("70.00"));
+		assertThat(ledgerEntriesOf(first.id())).hasSize(2);
+	}
+
+	@Test
+	void sameKeyWithADifferentRequestIsRejectedAndChangesNothing() {
+		UUID ana = open(EUR, "100.00");
+		UUID bob = open(EUR, "0");
+		String key = newKey();
+		transferService.transfer(key, request(ana, bob, "30.00", EUR));
+
+		assertRejected(key, request(bob, ana, "30.00", EUR), Reason.IDEMPOTENCY_KEY_REUSED);
+
+		assertThat(balanceOf(ana)).isEqualTo(new BigDecimal("70.00"));
+		assertThat(balanceOf(bob)).isEqualTo(new BigDecimal("30.00"));
+	}
+
+	/** Only completed transfers are stored, so a rejected request doesn't use up its key. */
+	@Test
+	void aRejectedRequestDoesNotUseUpItsKey() {
+		UUID ana = open(EUR, "10.00");
+		UUID bob = open(EUR, "0");
+		String key = newKey();
+
+		assertRejected(key, request(ana, bob, "50.00", EUR), Reason.INSUFFICIENT_FUNDS);
+		transferService.transfer(key, request(ana, bob, "5.00", EUR));
+
+		assertThat(balanceOf(ana)).isEqualTo(new BigDecimal("5.00"));
+	}
+
+	/**
+	 * The race: several requests with the same key start at the same instant, so all of them can pass
+	 * the "seen this key?" lookup before any has committed. The unique constraint lets exactly one
+	 * insert win. Each loser either sees the winner's transfer (if it looked after the commit) or gets
+	 * a ConflictException (409). Money moves once.
+	 */
+	@Test
+	void concurrentRequestsWithTheSameKeyMoveMoneyOnce() throws Exception {
+		UUID ana = open(EUR, "100.00");
+		UUID bob = open(EUR, "0");
+		String key = newKey();
+		TransferRequest request = request(ana, bob, "30.00", EUR);
+		int threads = 8;
+
+		List<UUID> returnedIds = new ArrayList<>();
+		int conflicts = 0;
+		CountDownLatch startGate = new CountDownLatch(1);
+		try (ExecutorService pool = Executors.newFixedThreadPool(threads)) {
+			List<Future<TransferResponse>> results = new ArrayList<>();
+			for (int i = 0; i < threads; i++) {
+				results.add(pool.submit(() -> {
+					startGate.await();
+					return transferService.transfer(key, request);
+				}));
+			}
+			startGate.countDown();
+			for (Future<TransferResponse> result : results) {
+				try {
+					returnedIds.add(result.get(30, TimeUnit.SECONDS).id());
+				} catch (ExecutionException failure) {
+					assertThat(failure.getCause()).isInstanceOf(ConflictException.class);
+					conflicts++;
+				}
+			}
+		}
+
+		assertThat(returnedIds).isNotEmpty();
+		assertThat(returnedIds).containsOnly(returnedIds.getFirst());
+		assertThat(returnedIds.size() + conflicts).isEqualTo(threads);
+		assertThat(balanceOf(ana)).isEqualTo(new BigDecimal("70.00"));
+		assertThat(balanceOf(bob)).isEqualTo(new BigDecimal("30.00"));
+		assertLedgerMatchesBalance(ana);
+		assertLedgerMatchesBalance(bob);
+	}
+
 	// --- helpers ---
 
 	private UUID open(Currency currency, String initialDeposit) {
 		return accountService.open(new OpenAccountRequest("Test owner", currency, new BigDecimal(initialDeposit))).id();
+	}
+
+	private static String newKey() {
+		return UUID.randomUUID().toString();
 	}
 
 	private static TransferRequest request(UUID from, UUID to, String amount, Currency currency) {
@@ -221,7 +320,11 @@ class TransferServiceIntegrationTest {
 	}
 
 	private void assertRejected(TransferRequest request, Reason expectedReason) {
-		assertThatThrownBy(() -> transferService.transfer(request))
+		assertRejected(newKey(), request, expectedReason);
+	}
+
+	private void assertRejected(String key, TransferRequest request, Reason expectedReason) {
+		assertThatThrownBy(() -> transferService.transfer(key, request))
 				.isInstanceOf(TransferRejectedException.class)
 				.extracting("reason")
 				.isEqualTo(expectedReason);

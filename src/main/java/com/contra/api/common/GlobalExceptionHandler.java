@@ -5,6 +5,8 @@ import java.util.TreeMap;
 
 import com.contra.api.transfer.TransferRejectedException;
 
+import org.springframework.context.MessageSourceResolvable;
+import org.springframework.core.MethodParameter;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -13,9 +15,13 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.validation.method.ParameterErrors;
+import org.springframework.validation.method.ParameterValidationResult;
 import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.WebRequest;
+import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 import tools.jackson.core.JacksonException;
 
@@ -32,6 +38,11 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 	@ExceptionHandler(NotFoundException.class)
 	ProblemDetail handleNotFound(NotFoundException exception) {
 		return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, exception.getMessage());
+	}
+
+	@ExceptionHandler(ConflictException.class)
+	ProblemDetail handleConflict(ConflictException exception) {
+		return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, exception.getMessage());
 	}
 
 	/** Well-formed request that breaks a business rule: 422, with a machine-readable reason. */
@@ -51,6 +62,36 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 			errors.put(fieldError.getField(), fieldError.getDefaultMessage());
 		}
 		return validationProblem(status, errors);
+	}
+
+	/**
+	 * Method validation failure: a constraint on a header or query parameter (Idempotency-Key, page,
+	 * size). Once a controller method has such a constraint, Spring MVC validates the whole method in one
+	 * go, so an invalid @Valid body also arrives here instead of in handleMethodArgumentNotValid.
+	 * Same response shape either way: field or parameter name → message.
+	 */
+	@Override
+	protected ResponseEntity<Object> handleHandlerMethodValidationException(HandlerMethodValidationException exception,
+			HttpHeaders headers, HttpStatusCode status, WebRequest request) {
+		Map<String, String> errors = new TreeMap<>();
+		for (ParameterValidationResult result : exception.getParameterValidationResults()) {
+			if (result instanceof ParameterErrors bodyErrors) {
+				for (FieldError fieldError : bodyErrors.getFieldErrors()) {
+					errors.put(fieldError.getField(), fieldError.getDefaultMessage());
+				}
+			} else {
+				for (MessageSourceResolvable error : result.getResolvableErrors()) {
+					errors.put(parameterName(result.getMethodParameter()), error.getDefaultMessage());
+				}
+			}
+		}
+		return validationProblem(status, errors);
+	}
+
+	/** The header name as the client sent it ("Idempotency-Key"), otherwise the Java parameter name. */
+	private static String parameterName(MethodParameter parameter) {
+		RequestHeader header = parameter.getParameterAnnotation(RequestHeader.class);
+		return header != null ? header.value() : parameter.getParameterName();
 	}
 
 	/**

@@ -40,10 +40,19 @@ public class Transfer {
 	@Column(nullable = false)
 	private Instant createdAt;
 
+	/** The client's Idempotency-Key header. Unique in the database. */
+	@Column(nullable = false)
+	private String idempotencyKey;
+
+	/** SHA-256 of the request, to tell a genuine retry from a different request reusing the key. */
+	@Column(nullable = false)
+	private String requestHash;
+
 	protected Transfer() {
 	}
 
-	public Transfer(UUID fromAccountId, UUID toAccountId, BigDecimal amount, Currency currency) {
+	public Transfer(UUID fromAccountId, UUID toAccountId, BigDecimal amount, Currency currency,
+			String idempotencyKey, String requestHash) {
 		this.id = UUID.randomUUID();
 		this.fromAccountId = fromAccountId;
 		this.toAccountId = toAccountId;
@@ -51,6 +60,8 @@ public class Transfer {
 		this.currency = currency;
 		this.status = TransferStatus.COMPLETED;
 		this.createdAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
+		this.idempotencyKey = idempotencyKey;
+		this.requestHash = requestHash;
 	}
 
 	public UUID getId() {
@@ -79,5 +90,13 @@ public class Transfer {
 
 	public Instant getCreatedAt() {
 		return createdAt;
+	}
+
+	public String getIdempotencyKey() {
+		return idempotencyKey;
+	}
+
+	public String getRequestHash() {
+		return requestHash;
 	}
 }

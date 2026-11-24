@@ -10,7 +10,8 @@ public class TransferRejectedException extends RuntimeException {
 		AMOUNT_NOT_POSITIVE("Amount must be greater than zero"),
 		SAME_ACCOUNT("Source and target account must be different"),
 		CURRENCY_MISMATCH("Both accounts and the transfer must use the same currency"),
-		INSUFFICIENT_FUNDS("Insufficient funds in the source account");
+		INSUFFICIENT_FUNDS("Insufficient funds in the source account"),
+		IDEMPOTENCY_KEY_REUSED("This Idempotency-Key was already used for a different request");
 
 		private final String message;
 

@@ -131,7 +131,8 @@ class AccountRepositoryTest {
 	}
 
 	private Transfer transferBetween(Account from, Account to) {
-		return transferRepository.save(new Transfer(from.getId(), to.getId(), new BigDecimal("1.00"), EUR));
+		return transferRepository.save(new Transfer(from.getId(), to.getId(), new BigDecimal("1.00"), EUR,
+				UUID.randomUUID().toString(), "test-hash"));
 	}
 
 	private LedgerEntry openingAt(Account account, String amount, Instant createdAt) {

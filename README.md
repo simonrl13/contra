@@ -3,7 +3,7 @@
 A REST API for bank accounts and money transfers between them: a double-entry ledger, idempotent
 transfers, and safe concurrent updates. Java 21, Spring Boot 4.1, PostgreSQL 16.
 
-> Work in progress. Done: setup, accounts, transfers with the ledger. Next: idempotency and locking.
+> Work in progress. Done: setup, accounts, transfers with the ledger, idempotency. Next: locking.
 
 ## Requirements
 - JDK 21
@@ -46,9 +46,12 @@ Errors are `application/problem+json`, with every invalid field listed:
 {"detail":"Request validation failed","instance":"/accounts","status":400,"title":"Bad Request",
  "errors":{"initialDeposit":"must be greater than or equal to 0","ownerName":"must not be blank"}}
 ```
-Move money (same currency only). The response is the transfer, and both accounts get a ledger entry:
+Move money (same currency only). The response is the transfer, and both accounts get a ledger entry.
+`Idempotency-Key` is required: generate one per intended transfer and send the same one on every retry.
+A retry with the same key and body returns the original transfer and moves no money.
 ```bash
 curl -i -X POST localhost:8080/transfers -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $(uuidgen)" \
   -d '{"fromAccountId":"<ana-id>","toAccountId":"<bob-id>","amount":30,"currency":"EUR"}'
 curl localhost:8080/transfers/<transfer-id>
 curl 'localhost:8080/accounts/<ana-id>/transactions?page=0&size=20'   # newest first, max size 100
@@ -64,7 +67,8 @@ A transfer that breaks a business rule is a 422 with a machine-readable `reason`
 |---|---|
 | 400 | Invalid field, more than 2 decimals, unknown currency code, malformed JSON or id, bad page/size |
 | 404 | Unknown account or transfer |
-| 422 | Transfer breaks a business rule (see `reason`) |
+| 409 | Another request with the same `Idempotency-Key` was being processed at the same moment; retry |
+| 422 | Transfer breaks a business rule, or the `Idempotency-Key` was already used for a different request (see `reason`) |
 
 ## Run the tests
 ```bash
@@ -86,6 +90,10 @@ Filled in as each stage lands. Still to come: idempotency and the locking strate
   transaction debits, credits, inserts the transfer and its two ledger entries. A failure anywhere rolls
   all of it back (tested by forcing the ledger write to fail). Balance changes only go through
   `Account.debit/credit`, and ledger signs only through `LedgerEntry.transferDebit/transferCredit`.
+- **Idempotency in the same transaction as the money.** The key and a SHA-256 of the request are
+  columns on `transfers`, with a `UNIQUE` constraint on the key. The lookup catches ordinary retries;
+  the constraint catches two requests racing with the same key (the loser rolls back and gets 409).
+  Only completed transfers are stored, so a rejected request doesn't use up its key.
 - **Constraints in the database too.** `CHECK (balance >= 0)`, a debit must be negative, and a credit
   must be positive. The service enforces these rules, and the database stops any bug that gets past it.
 - **Currency is `java.util.Currency`.** Unknown ISO codes are rejected while the JSON is parsed. Known

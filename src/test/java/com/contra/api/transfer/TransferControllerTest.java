@@ -5,6 +5,7 @@ import java.time.Instant;
 import java.util.Currency;
 import java.util.UUID;
 
+import com.contra.api.common.ConflictException;
 import com.contra.api.common.NotFoundException;
 import com.contra.api.transfer.TransferRejectedException.Reason;
 
@@ -33,6 +34,8 @@ class TransferControllerTest {
 	private static final UUID FROM = UUID.fromString("7b0e1e4a-1111-4c5e-9d3a-000000000001");
 	private static final UUID TO = UUID.fromString("7b0e1e4a-1111-4c5e-9d3a-000000000002");
 
+	private static final String KEY = "key-1";
+
 	private static final String VALID_BODY = """
 			{"fromAccountId": "%s", "toAccountId": "%s", "amount": 30, "currency": "EUR"}
 			""".formatted(FROM, TO);
@@ -45,11 +48,11 @@ class TransferControllerTest {
 
 	@Test
 	void createReturns201WithLocationAndBody() throws Exception {
-		when(transferService.transfer(any())).thenReturn(new TransferResponse(TRANSFER_ID, FROM, TO,
+		when(transferService.transfer(any(), any())).thenReturn(new TransferResponse(TRANSFER_ID, FROM, TO,
 				new BigDecimal("30.00"), Currency.getInstance("EUR"), TransferStatus.COMPLETED,
 				Instant.parse("2026-01-15T10:00:00Z")));
 
-		mockMvc.perform(post("/transfers").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+		mockMvc.perform(post("/transfers").header("Idempotency-Key", KEY).contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
 				.andExpect(status().isCreated())
 				.andExpect(header().string("Location", "/transfers/" + TRANSFER_ID))
 				.andExpect(jsonPath("$.status").value("COMPLETED"))
@@ -58,9 +61,9 @@ class TransferControllerTest {
 
 	@Test
 	void businessRuleViolationReturns422WithReason() throws Exception {
-		when(transferService.transfer(any())).thenThrow(new TransferRejectedException(Reason.INSUFFICIENT_FUNDS));
+		when(transferService.transfer(any(), any())).thenThrow(new TransferRejectedException(Reason.INSUFFICIENT_FUNDS));
 
-		mockMvc.perform(post("/transfers").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+		mockMvc.perform(post("/transfers").header("Idempotency-Key", KEY).contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
 				.andExpect(status().isUnprocessableContent())
 				.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
 				.andExpect(jsonPath("$.status").value(422))
@@ -70,15 +73,15 @@ class TransferControllerTest {
 
 	@Test
 	void unknownAccountReturns404() throws Exception {
-		when(transferService.transfer(any())).thenThrow(new NotFoundException("Account", FROM));
+		when(transferService.transfer(any(), any())).thenThrow(new NotFoundException("Account", FROM));
 
-		mockMvc.perform(post("/transfers").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+		mockMvc.perform(post("/transfers").header("Idempotency-Key", KEY).contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
 				.andExpect(status().isNotFound());
 	}
 
 	@Test
 	void missingFieldsAndNonPositiveAmountReturn400() throws Exception {
-		mockMvc.perform(post("/transfers").contentType(MediaType.APPLICATION_JSON).content("""
+		mockMvc.perform(post("/transfers").header("Idempotency-Key", KEY).contentType(MediaType.APPLICATION_JSON).content("""
 				{"amount": 0}
 				"""))
 				.andExpect(status().isBadRequest())
@@ -88,6 +91,36 @@ class TransferControllerTest {
 				.andExpect(jsonPath("$.errors.amount").value("must be greater than 0"));
 
 		verifyNoInteractions(transferService);
+	}
+
+	@Test
+	void missingIdempotencyKeyReturns400() throws Exception {
+		mockMvc.perform(post("/transfers").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+				.andExpect(status().isBadRequest())
+				.andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON));
+
+		verifyNoInteractions(transferService);
+	}
+
+	@Test
+	void blankOrTooLongIdempotencyKeyReturns400() throws Exception {
+		for (String key : new String[] {" ", "k".repeat(101)}) {
+			mockMvc.perform(post("/transfers").header("Idempotency-Key", key)
+					.contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+					.andExpect(status().isBadRequest())
+					.andExpect(jsonPath("$.errors['Idempotency-Key']").exists());
+		}
+		verifyNoInteractions(transferService);
+	}
+
+	@Test
+	void concurrentDuplicateReturns409() throws Exception {
+		when(transferService.transfer(any(), any())).thenThrow(new ConflictException("processed concurrently"));
+
+		mockMvc.perform(post("/transfers").header("Idempotency-Key", KEY)
+				.contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+				.andExpect(status().isConflict())
+				.andExpect(jsonPath("$.detail").value("processed concurrently"));
 	}
 
 	@Test

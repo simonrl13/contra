@@ -1,5 +1,7 @@
 package com.contra.api.transfer;
 
+import java.util.UUID;
+
 import com.contra.api.TestcontainersConfiguration;
 
 import org.junit.jupiter.api.Test;
@@ -9,7 +11,9 @@ import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -29,8 +33,7 @@ class TransferApiIntegrationTest {
 		String ana = openAccount("100.00");
 		String bob = openAccount("0");
 
-		String location = mockMvc.perform(post("/transfers").contentType(MediaType.APPLICATION_JSON)
-				.content(transferBody(ana, bob, "30")))
+		String location = mockMvc.perform(postTransfer(UUID.randomUUID().toString(), transferBody(ana, bob, "30")))
 				.andExpect(status().isCreated())
 				.andExpect(jsonPath("$.amount").value(30.00))
 				.andReturn().getResponse().getHeader("Location");
@@ -58,10 +61,46 @@ class TransferApiIntegrationTest {
 		String ana = openAccount("10.00");
 		String bob = openAccount("0");
 
-		mockMvc.perform(post("/transfers").contentType(MediaType.APPLICATION_JSON)
-				.content(transferBody(ana, bob, "50")))
+		mockMvc.perform(postTransfer(UUID.randomUUID().toString(), transferBody(ana, bob, "50")))
 				.andExpect(status().isUnprocessableContent())
 				.andExpect(jsonPath("$.reason").value("INSUFFICIENT_FUNDS"));
+	}
+
+	@Test
+	void retryWithTheSameKeyReturnsTheOriginalTransferAndMovesMoneyOnce() throws Exception {
+		String ana = openAccount("100.00");
+		String bob = openAccount("0");
+		String key = UUID.randomUUID().toString();
+
+		String first = mockMvc.perform(postTransfer(key, transferBody(ana, bob, "30")))
+				.andExpect(status().isCreated())
+				.andReturn().getResponse().getContentAsString();
+		// "30.00" is the same amount as "30": still the same request
+		String retry = mockMvc.perform(postTransfer(key, transferBody(ana, bob, "30.00")))
+				.andExpect(status().isCreated())
+				.andReturn().getResponse().getContentAsString();
+
+		assertThat(retry).isEqualTo(first);
+		mockMvc.perform(get("/accounts/{id}", ana)).andExpect(jsonPath("$.balance").value(70.00));
+	}
+
+	@Test
+	void sameKeyWithADifferentBodyReturns422() throws Exception {
+		String ana = openAccount("100.00");
+		String bob = openAccount("0");
+		String key = UUID.randomUUID().toString();
+
+		mockMvc.perform(postTransfer(key, transferBody(ana, bob, "30"))).andExpect(status().isCreated());
+
+		mockMvc.perform(postTransfer(key, transferBody(ana, bob, "31")))
+				.andExpect(status().isUnprocessableContent())
+				.andExpect(jsonPath("$.reason").value("IDEMPOTENCY_KEY_REUSED"));
+		mockMvc.perform(get("/accounts/{id}", ana)).andExpect(jsonPath("$.balance").value(70.00));
+	}
+
+	private static MockHttpServletRequestBuilder postTransfer(String idempotencyKey, String body) {
+		return post("/transfers").header("Idempotency-Key", idempotencyKey)
+				.contentType(MediaType.APPLICATION_JSON).content(body);
 	}
 
 	private String openAccount(String initialDeposit) throws Exception {

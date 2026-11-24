@@ -27,9 +27,9 @@ caller owns the source account.
 | Malformed or hostile input | Bean Validation on request DTOs (lengths, signs, at most 2 decimals, ISO currency); errors returned as ProblemDetail without stack traces or Jackson internals | Stages 2 and 3 |
 | SQL injection | JPA, Spring Data derived queries and parameterised JPQL only; no string-built SQL | Stage 2, re-checked each stage |
 | Invalid data reaching the DB through a bug | CHECK constraints: balance >= 0, debit/credit signs, ISO currency format, transfer amount > 0 and different accounts; FK from ledger entries to transfers | Stages 2 and 3 |
-| Double spending through retries | Required `Idempotency-Key` with a unique constraint; a key reused with a different payload is rejected (422) | Stage 4 |
+| Double spending through retries | Required `Idempotency-Key` with a unique constraint, written in the same transaction as the money movement; a key reused with a different payload is rejected (422); concurrent duplicates: one wins, the rest get 409 (tested with 8 threads) | Stage 4 |
 | Overdraft through concurrent requests | Row locking plus a `CHECK (balance >= 0)` constraint in the database | Stages 2 and 5 |
-| Idempotency key abuse (guessing or reusing someone else's key) | Keys are scoped to the request payload. Without authentication they can't be scoped per client, a known gap | Partial, Stage 4 |
+| Idempotency key abuse (guessing or reusing someone else's key) | A reused key only replays if the payload hash matches. Keys are global: without authentication they can't be scoped per client, so a client who knows another's key and payload can read that transfer. Keys never expire | Partial (known gap) |
 | Leaked credentials | Env vars only, `.env` git-ignored, IAM roles in AWS | Stage 1 (local), Stage 7 (AWS) |
 | Vulnerable dependencies | Versions managed by the Spring Boot parent; Dependabot alerts | Dependabot: Stage 6 |
 | Database exposed on the network | Local Postgres port bound to `127.0.0.1` only; RDS in private subnets in AWS | Stage 1 (local), Stage 7 (AWS) |

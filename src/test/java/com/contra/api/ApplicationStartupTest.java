@@ -44,7 +44,7 @@ class ApplicationStartupTest {
 	void flywayAppliedAllMigrations() {
 		assertThat(flyway.info().pending()).isEmpty();
 		assertThat(flyway.info().applied()).extracting(migration -> migration.getVersion().getVersion())
-				.containsExactly("1", "2", "3");
+				.containsExactly("1", "2", "3", "4");
 		assertThat(tableExists("accounts")).isTrue();
 		assertThat(tableExists("ledger_entries")).isTrue();
 		assertThat(tableExists("transfers")).isTrue();

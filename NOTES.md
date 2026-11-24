@@ -269,3 +269,152 @@ repository throw.
    reason about: a rejection leaves no dirty state in memory, nothing is flushed, and the reader sees
    "validate, then act". It also avoids relying on rollback for normal control flow, which matters if
    someone later catches the exception inside the transaction.</details>
+
+---
+
+## Stage 4: Idempotency
+
+### What we built
+`POST /transfers` now requires an `Idempotency-Key` header (1-100 characters). Each transfer row stores
+the key (unique in the database) and a SHA-256 hash of the request. A retry with the same key and the
+same request returns the original transfer (201, same body) and moves no money. The same key with a
+different request is a 422 with `reason: IDEMPOTENCY_KEY_REUSED`. If two requests with the same key run
+at the same instant, the database lets exactly one through. The others get a 409, and a retry returns
+the winner's result. Migration `V4__transfer_idempotency`.
+
+### Thought process
+**Why idempotency at all?**
+A client sends a transfer, the network drops the response, and the client retries. Without
+idempotency that's two transfers. The client can't know whether the first one happened, so the server
+must make "send it again" safe. The client generates a key (usually a UUID) per *intended* operation
+and reuses it on every retry.
+
+**Where to store the key.**
+- Options: (a) a separate `idempotency_keys` table storing the key, hash and serialised response;
+  (b) columns on `transfers`.
+- Chosen: (b). A transfer is the only idempotent operation, and the stored transfer *is* the original
+  result, so there's nothing extra to serialise. One table, one insert, one unique constraint.
+- Trade-off: only completed transfers are remembered. A rejected request (422) doesn't use up its key,
+  so a retry after the client fixes the problem (for example after a deposit) is evaluated again. A
+  separate table could store failures too (Stripe stores the response whatever it was). We accept
+  this because a rejection changes nothing, so re-evaluating it can't double-spend. It's tested in
+  `aRejectedRequestDoesNotUseUpItsKey`.
+
+**Why a request hash?**
+- Problem: the same key with a *different* body is a client bug (or an attack). Silently returning the
+  old transfer would hide it.
+- Options: compare the stored transfer's columns with the request, or store a hash.
+- Chosen: SHA-256 over `from|to|amount|currency`, with the amount normalised first so `30` and
+  `30.00` are the same request. The hash is fixed-size and would also cover fields that are not stored
+  on the transfer (a future free-text reference, for example). Comparing columns would work as well
+  for today's request; the hash is what was planned and it generalises.
+
+**The race (two requests, same key, same instant).**
+- Problem: both run `findByIdempotencyKey`, both see nothing, both go on to transfer.
+- Options: (a) lock something before the lookup (a key table row, an advisory lock); (b) let the
+  `UNIQUE` constraint decide and handle the loser.
+- Chosen: (b). In PostgreSQL the second `INSERT` of the same key *waits* for the first transaction,
+  then fails with a unique violation once the first commits. The loser's whole transaction rolls back,
+  balance changes included, so money moves once. The loser gets 409 Conflict ("retry to get its
+  result"), and the retry hits the lookup and returns the original transfer.
+- Trade-off: the loser sees a 409 instead of the original result. A client that already retries on
+  timeouts handles that easily. Stage 5 improves the same-payload case: the lookup moves after the
+  account locks, so a concurrent duplicate waits and then replays the original instead of a 409.
+
+**Flush early.** `saveAndFlush` sends the `INSERT` immediately instead of at commit, so the unique
+violation is thrown inside the method, where it can be recognised and turned into a 409. At commit it
+would surface from Spring's transaction interceptor, outside our code.
+
+**Recognising *our* constraint.** Only a violation of `transfers_idempotency_key_unique` becomes a 409.
+Any other integrity error is rethrown unchanged, because hiding a CHECK violation as "retry" would
+mask a bug. The check reads Hibernate's `ConstraintViolationException.getConstraintName()`, not the
+error text, which is localised.
+
+**Method validation side effect (Spring MVC 6.1+).** Adding `@NotBlank @Size` on the header makes
+Spring validate the whole controller method at once. Body errors then arrive as
+`HandlerMethodValidationException` instead of `MethodArgumentNotValidException`, and the `errors` map
+disappeared. A failing test caught this. The fix is one more override in `GlobalExceptionHandler`
+that produces the same shape, with the header name (`Idempotency-Key`) or parameter name as the key.
+
+### Code walkthrough: the idempotency path in `TransferService.transfer`
+```java
+BigDecimal amount = Money.normalize(request.amount());
+String requestHash = requestHash(request, amount);
+```
+Normalise before hashing, otherwise `30` and `30.00` give different hashes and a harmless retry
+becomes a 422.
+```java
+Optional<Transfer> earlier = transferRepository.findByIdempotencyKey(idempotencyKey);
+if (earlier.isPresent()) return replay(earlier.get(), requestHash);
+```
+The fast path for retries, before any validation. A replay doesn't re-check funds: the money already
+moved, so re-checking would wrongly reject a retry after the balance dropped. Remove this and every
+retry is a second transfer (stopped only by the unique constraint, as a 409).
+```java
+private static TransferResponse replay(Transfer earlier, String requestHash) {
+    if (!earlier.getRequestHash().equals(requestHash)) throw ... IDEMPOTENCY_KEY_REUSED;
+    return TransferResponse.from(earlier);
+}
+```
+Same key, different request → 422. Remove the comparison and a client bug that reuses keys gets a
+wrong "success" for a transfer it never asked for.
+```java
+Transfer transfer = insertOnce(new Transfer(..., idempotencyKey, requestHash));
+```
+`insertOnce` = `saveAndFlush` + catch `DataIntegrityViolationException` → if it's our constraint,
+`ConflictException` (409), else rethrow. Remove the `UNIQUE` constraint and the race above becomes a
+double transfer; nothing in Java alone can prevent it without a lock.
+
+### What an interviewer would challenge
+- **"What if the DB crashes after the transfer commits but before the response reaches the client?"**
+  That's exactly the case idempotency exists for: the client retries with the same key and gets the
+  committed transfer back.
+- **"Why not check the key in Redis/memory?"** It would be a second system that must agree with the
+  database, and a crash between "money moved" and "key recorded" breaks it. Here the key is written in
+  the same transaction as the money movement, so they can't disagree.
+- **"Keys never expire. Isn't that a problem?"** The table grows with transfers anyway, so the extra
+  column is small. Real APIs often expire keys (Stripe: 24 hours) so keys can be reused. That would
+  be a scheduled cleanup or a `created_at` condition in the lookup. Not needed for this scope.
+- **"Keys are global, not per client."** Correct. Without authentication there's no client identity.
+  With auth, the unique constraint becomes `(client_id, idempotency_key)`, otherwise one client could
+  guess another's key and receive their transfer details. It's listed in SECURITY.md.
+- **"Why 422 for a key reused with a different body, and 409 for the race?"** 422: the request is
+  well-formed but semantically invalid, and retrying won't help. 409: a temporary conflict with another
+  request in flight, and retrying *will* help.
+- **"Is the hash a security feature?"** No. It's a fingerprint for equality, not a secret. SHA-256 is
+  used because it's standard and collision-resistant, not because anything is hidden.
+
+### Spring Boot 4 vs 3.x (seen in this stage)
+| | Boot 3.0-3.1 (Spring 6.0) | Boot 3.2+ and 4.x (Spring 6.1+ / 7) |
+|---|---|---|
+| Constraints on `@RequestHeader`/`@RequestParam` | needed `@Validated` on the class (AOP), threw `ConstraintViolationException` → 500 by default | built-in method validation, throws `HandlerMethodValidationException` → 400 via `ResponseEntityExceptionHandler` |
+| `@Valid` body when the method also has parameter constraints | `MethodArgumentNotValidException` | `HandlerMethodValidationException` (with `ParameterErrors` for the body) |
+
+### Practice questions
+1. A client sends a transfer, times out and retries. Walk through what happens on the server.
+   <details><summary>Answer</summary>Case 1: the first request committed. The retry's lookup finds
+   the key, the hash matches, and it returns the stored transfer with 201. No money moves. Case 2: the
+   first is still running. The retry passes the lookup, does the transfer in memory, and its insert
+   waits on the unique index until the first commits. Then it fails, rolls back, and returns 409. The
+   client retries again and gets case 1. Case 3: the first failed or was rejected. Nothing was stored,
+   so the retry is evaluated as a new request.</details>
+2. Why can't `findByIdempotencyKey` alone guarantee at-most-once?
+   <details><summary>Answer</summary>Check-then-act race: two transactions can both run the lookup
+   before either commits, and both see nothing. Under READ COMMITTED (the PostgreSQL default) neither
+   sees the other's uncommitted insert. Only something atomic in the database closes the gap: the
+   unique constraint (or a lock). The lookup is the fast path for the common case, and the constraint is
+   the guarantee.</details>
+3. Why is the key stored in the same table and transaction as the transfer?
+   <details><summary>Answer</summary>So "money moved" and "key used" are one atomic fact. If the key
+   lived in another store, or another transaction, a crash between the two writes would leave money
+   moved with no key (the retry double-spends) or a key with no money moved (the retry returns a
+   transfer that doesn't exist).</details>
+4. Why does a replay skip the balance check?
+   <details><summary>Answer</summary>The replay doesn't move money; it reports what already happened.
+   If the balance dropped since then, re-checking would answer "insufficient funds" to a retry of a
+   transfer that actually succeeded, and the client would think it failed.</details>
+5. What would you change to make keys per client?
+   <details><summary>Answer</summary>Add authentication, store the client id on the transfer, and make
+   the unique constraint `(client_id, idempotency_key)`. The lookup becomes
+   `findByClientIdAndIdempotencyKey`. Otherwise one client can reuse another's key and, if it knows
+   the payload, read their transfer.</details>

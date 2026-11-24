@@ -12,8 +12,11 @@ their GitHub profile for anything sensitive.
   from environment variables only, and `application.yml` has no default values for them.
 - Locally they live in `.env`, which is git-ignored. `.env.example` holds placeholders only.
 - Tests use a throwaway Testcontainers database with generated credentials.
-- In AWS (Stage 7), the database password will live in Secrets Manager and reach the app through the
-  ECS task's IAM role. Deploys will use GitHub OIDC, so there are no long-lived AWS access keys.
+- AWS (planned in docs/aws.md, not deployed): RDS generates the database password and keeps it in
+  Secrets Manager. ECS injects it at task start using the task execution role, which may read only that
+  one secret. The template and task definition hold only the secret's ARN. The app has no task role
+  (no AWS permissions). Deploys use GitHub OIDC with a role limited to one repository and environment,
+  so there are no long-lived AWS access keys anywhere.
 
 ## Authentication and authorisation
 **Not implemented.** Anyone who can reach the API can create accounts and move money between them.
@@ -30,12 +33,12 @@ caller owns the source account.
 | Double spending through retries | Required `Idempotency-Key` with a unique constraint, written in the same transaction as the money movement; a key reused with a different payload is rejected (422); concurrent duplicates: one wins, the rest get 409 (tested with 8 threads) | Stage 4 |
 | Overdraft through concurrent requests | `SELECT ... FOR UPDATE` on both accounts, in a fixed order; `CHECK (balance >= 0)` in the database; tested with 200 concurrent transfers | Stages 2 and 5 |
 | Idempotency key abuse (guessing or reusing someone else's key) | A reused key only replays if the payload hash matches. Keys are global: without authentication they can't be scoped per client, so a client who knows another's key and payload can read that transfer. Keys never expire | Partial (known gap) |
-| Leaked credentials | Env vars only, `.env` git-ignored, IAM roles in AWS | Stage 1 (local), Stage 7 (AWS) |
+| Leaked credentials | Env vars only, `.env` git-ignored and docker-ignored; in AWS: RDS-managed secret, IAM roles, GitHub OIDC (planned) | Stage 1 (local), Stage 7 (AWS plan) |
 | Vulnerable dependencies | Versions managed by the Spring Boot parent; Dependabot weekly PRs for Maven, GitHub Actions and Docker base images | Stage 6 |
 | Compromised container | Runtime image has only the JRE and the jar, runs as uid 10001 (not root), jar owned by root and read-only to the app; no `.env` in the build context (`.dockerignore`) | Stage 6 |
 | Information leak through operational endpoints | Actuator exposes `health` only, without component details; `/actuator/env` etc. return 404 (tested) | Stage 6 |
 | CI supply chain | Workflow token is `contents: read`; no secrets in CI; actions pinned to a major version (Dependabot keeps them current). Not pinned to commit SHAs, a known gap | Stage 6 |
-| Database exposed on the network | Local Postgres port bound to `127.0.0.1` only; RDS in private subnets in AWS | Stage 1 (local), Stage 7 (AWS) |
+| Database exposed on the network | Local Postgres port bound to `127.0.0.1` only; in AWS: RDS in private subnets, reachable only from the app's security group (planned) | Stage 1 (local), Stage 7 (AWS plan) |
 
 ## Known gaps
 - No authentication or authorisation (see above).

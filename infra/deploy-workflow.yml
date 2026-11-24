@@ -1,0 +1,66 @@
+# INACTIVE on purpose: GitHub only runs workflows in .github/workflows/. When you're ready to deploy
+# (docs/aws.md, step 5), copy this file to .github/workflows/deploy.yml.
+#
+# Manual deploy: test, build the image, push it to ECR tagged with the commit SHA, then point the ECS
+# service at it. AWS access comes from GitHub OIDC (infra/github-oidc.yml): no AWS keys are stored in GitHub.
+name: Deploy to AWS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # lets the job request an OIDC token, which AWS exchanges for 1-hour credentials
+
+concurrency:
+  group: deploy-aws
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: aws # must match the role's trust policy; restrict this environment to main in GitHub
+    timeout-minutes: 30
+    env:
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Test
+        run: ./mvnw -B verify
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push the image
+        run: |
+          docker build -t "${{ steps.ecr.outputs.registry }}/contra-api:$IMAGE_TAG" .
+          docker push "${{ steps.ecr.outputs.registry }}/contra-api:$IMAGE_TAG"
+
+      - name: Current task definition
+        run: aws ecs describe-task-definition --task-definition contra-api --query taskDefinition > task-definition.json
+
+      - id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: app
+          image: ${{ steps.ecr.outputs.registry }}/contra-api:${{ env.IMAGE_TAG }}
+
+      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: contra-api
+          service: contra-api
+          wait-for-service-stability: true

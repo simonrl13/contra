@@ -1,6 +1,157 @@
 # Interview notes
 
-One entry per stage: what we built, the key concepts, and questions to practise out loud.
+Start here: the pitch, the architecture, a one-page cheat sheet and how AI was used. After that comes one
+entry per stage: what we built, the thought process, a code walkthrough, what an interviewer would
+challenge, and practice questions (answers hidden in `<details>`).
+
+---
+
+## The 2-minute pitch
+> contra-api is a REST API for bank accounts and money transfers, built with Java 21, Spring Boot 4.1 and
+> PostgreSQL 16. I built it to practise what matters in banking backends: correctness under failure and
+> under concurrency.
+>
+> Every transfer is double-entry. It writes a debit and a credit to an append-only ledger in the same
+> transaction as the balance updates, so an account's balance always equals the sum of its ledger
+> entries. The tests check that invariant everywhere. Money is `BigDecimal` with exactly two decimals:
+> anything with more is rejected rather than rounded.
+>
+> Two things make it safe in the real world. First, idempotency: every transfer needs an
+> `Idempotency-Key`. A retry with the same key returns the original result instead of moving money
+> twice, and a unique constraint in the database catches two retries racing each other. Second,
+> concurrency: the service locks both accounts with `SELECT ... FOR UPDATE`, always in the same order, so
+> concurrent transfers queue instead of losing updates or deadlocking. I chose pessimistic over
+> optimistic locking because it needs no retry loop, and I can explain the trade-off.
+>
+> I tested it against real PostgreSQL with Testcontainers, including a test that fires 200 transfers
+> from 16 threads at once and checks that no balance goes negative and no money is created or lost. I
+> also checked that test catches real bugs: it fails when I remove the locks or the lock ordering. The
+> project ships as a non-root Docker image with CI on GitHub Actions, and I have a costed AWS deployment
+> plan with least-privilege IAM and no long-lived keys.
+>
+> I used Claude Code to write much of the code. My job was the design decisions, reviewing every line,
+> and making sure each claim is backed by a test or a real run.
+
+## Architecture: one request, from controller to commit
+```
+POST /transfers  (Idempotency-Key header, JSON body)
+ │
+ ├─ TransferController            HTTP only: @Valid body + @NotBlank @Size header → 400 if invalid
+ │                                 (GlobalExceptionHandler turns every exception into ProblemDetail JSON)
+ ▼
+ TransferService.transfer         @Transactional: one DB transaction from here to the return
+ │  1. normalise amount (scale 2), hash the request (SHA-256)
+ │  2. amount > 0, from ≠ to                               → 422 AMOUNT_NOT_POSITIVE / SAME_ACCOUNT
+ │  3. SELECT ... FOR NO KEY UPDATE both accounts, smaller UUID first   (waits if another transfer holds them)
+ │  4. key already used?  same hash → return the original (201)  |  different hash → 422 IDEMPOTENCY_KEY_REUSED
+ │  5. currencies match, source has funds                  → 422 CURRENCY_MISMATCH / INSUFFICIENT_FUNDS
+ │  6. account.debit / account.credit                       (in memory; dirty checking writes them later)
+ │  7. INSERT transfer + flush        unique key clash → rollback, 409
+ │  8. INSERT 2 ledger entries        (−amount for the source, +amount for the target)
+ ▼
+ commit: Hibernate flushes the 2 account UPDATEs; PostgreSQL commits 5 statements atomically; locks released
+ │
+ ▼
+ 201 Created, Location: /transfers/{id}, body = TransferResponse (a record DTO, never the entity)
+```
+Layers: Controller → Service → Repository (Spring Data JPA) → PostgreSQL. The schema belongs to Flyway
+(V1-V4), and Hibernate only validates it. Packages are by feature: `account`, `ledger`, `transfer`, `common`.
+
+## Cheat sheet
+**Transactions (`@Transactional`)**
+- Applied by a Spring proxy: calling a `@Transactional` method from the same class skips it. Rolls back
+  on `RuntimeException` by default (not on checked exceptions).
+- Inside a transaction, loaded entities are *managed*. Changes are written at flush/commit (dirty
+  checking), with no `save()` needed. `readOnly = true` skips dirty checking.
+- Atomic in PostgreSQL: the commit record hits the WAL in one step, so a crash leaves all or nothing.
+  The default isolation is READ COMMITTED: each statement sees what was committed before it started.
+
+**Locking**
+- Lost update = two read-modify-writes overlap. Fixes: pessimistic (`@Lock(PESSIMISTIC_WRITE)` → `FOR
+  UPDATE`/`FOR NO KEY UPDATE`: others wait), optimistic (`@Version` → `UPDATE ... WHERE version = ?`,
+  0 rows = conflict → retry), an atomic `UPDATE ... WHERE balance >= ?`, or `SERIALIZABLE`.
+- Pessimistic: deterministic and queues under contention, but deadlock risk → **lock in a global order**.
+  Optimistic: no DB locks and good for rare conflicts, but needs a retry loop and suffers retry storms.
+- Locks live in the database, so they work across app instances. `synchronized` protects one JVM only.
+
+**Idempotency**
+- The client sends a unique key per intended operation, and the same key on retries. The server
+  stores it *in the same transaction* as the effect.
+- Same key + same payload → the original result. Same key + different payload → 422. A race →
+  unique constraint, the loser rolls back → 409 (here: identical requests wait on the account locks and
+  replay instead).
+- The lookup is the fast path. The **unique constraint** is the guarantee (check-then-act races).
+
+**Double-entry ledger**
+- Every movement is two entries that sum to zero (debit −, credit +). Append-only: corrections are new
+  entries, never updates.
+- Invariant: balance = `SUM(entries)`. The stored balance is an O(1) cache of it, protected by tests and
+  CHECK constraints (`balance >= 0`, sign matches type).
+
+**BigDecimal**
+- Never `double` (0.1 + 0.2 ≠ 0.3). Construct from a `String`, not a `double`.
+- `equals` compares scale (`1.0` ≠ `1.00`), `compareTo` doesn't. Normalise to scale 2. Round only with
+  an explicit `RoundingMode` (here `UNNECESSARY`: refuse to round). DB type `NUMERIC(19,2)`.
+
+**Flyway**
+- Versioned SQL migrations `V<n>__name.sql`, applied once, in order, recorded in `flyway_schema_history`,
+  and checksummed (editing an applied file fails startup).
+- With `ddl-auto: validate`, Hibernate checks but never changes the schema. Never `update` in shared environments.
+
+**Testcontainers**
+- Real PostgreSQL in Docker per test run. `@ServiceConnection` wires the DataSource automatically.
+- Catches what H2 can't: real locking, `FOR UPDATE`, CHECK/unique constraints, `NUMERIC`, SQL dialect.
+- Slices: `@WebMvcTest` (MVC only, service mocked), `@DataJpaTest` (JPA only, rolled back), `@SpringBootTest` (everything).
+
+**ProblemDetail (RFC 9457)**
+- A standard error body: `type`, `title`, `status`, `detail`, `instance`, plus custom properties
+  (`errors`, `reason`). Content type `application/problem+json`.
+- `@RestControllerAdvice extends ResponseEntityExceptionHandler` → Spring's own errors use it too. Map
+  domain exceptions to statuses in one place: 400 bad input, 404 not found, 409 conflict/retry, 422 business rule.
+
+## How I used AI on this project
+**What Claude Code generated.**
+- Stages 1-2: Claude wrote the setup, configuration, migrations, DTOs, the account code and the tests.
+  I reviewed and approved each stage before its commit, and some fixes came from my review (for example
+  the locale bug and a clear startup message for missing env vars).
+- Stages 3-6: originally, I was going to write the transfer core, idempotency and locking myself, with
+  Claude writing only failing tests and TODOs. When I learned AI tools are allowed in the interview, I
+  changed the rule. Claude wrote all the code, each stage was committed after `./mvnw verify` passed,
+  and I review it afterwards. Stage 7 (AWS) was written as a plan and templates only.
+
+**How each part was verified.**
+- **Tests on real PostgreSQL**: 67 tests, all passing at the final commit. They include rollback (every
+  ledger save made to fail), constraints, idempotency races (8 threads, one key) and 200 concurrent
+  transfers on 16 threads.
+- **Testing the tests**: the concurrency test was run against two deliberately broken versions (no locks,
+  and locks without ordering). It failed both times, with an optimistic-lock error and a deadlock.
+  The idempotency race test was checked in the logs: 7 of 8 threads really hit the unique constraint.
+- **Real runs**: the Docker image was built and run with compose. Both containers became healthy, and
+  every API path was exercised with curl. The image runs as uid 10001. Springdoc was confirmed off with
+  the env vars used in AWS.
+- **Failures that review and tests caught along the way**: header validation silently changed the
+  400 error format (caught by an existing test); `mvnw` wasn't executable in git, which would have
+  broken CI on Linux; a stale build after a manual file restore produced a misleading deadlock; and
+  App Runner had closed to new customers, which a plan written from memory would have missed.
+- **Secrets scan**: `gitleaks` 8.30 over the full git history and the working tree found no leaks.
+- **Not verified**: the GitHub Actions workflow (no remote yet) and anything in AWS (templates only
+  pass `cfn-lint`).
+
+**What I'd check before trusting AI-generated code at a bank.**
+- **Money paths line by line**: rounding and scale, sign of every ledger entry, the order of check vs.
+  mutation, what happens on every exception path, and that the transaction boundary covers every write.
+- **Concurrency claims need a test that fails without the fix**: don't trust "this is thread-safe" or
+  a green test that never actually raced.
+- **The database as the last line of defence**: constraints, unique keys and FKs for every invariant
+  the code claims.
+- **Security**: no secrets in code, logs or images; least-privilege IAM (look for `Resource: "*"` and
+  unscoped `iam:PassRole`); input validation at the boundary; error messages that don't leak internals.
+- **Dependencies and facts**: every new library is justified and maintained; versions and service
+  availability are checked against current sources, not the model's memory (App Runner is the example).
+- **Claims match evidence**: every "it works" in the docs should point to a test or a run. If it
+  can't, it says "not verified".
+- **Ownership**: I can explain and rewrite every important method without the tool. That's what the
+  rest of this file is for.
 
 ---
 
@@ -47,10 +198,26 @@ against a real Postgres 16.
 **Practice questions**
 1. Why use Flyway migrations with `ddl-auto: validate` instead of `ddl-auto: update`? What happens at
    startup if an entity doesn't match the schema?
+   <details><summary>Answer</summary>Migrations are reviewed SQL, versioned in git, run in the same order
+   everywhere and recorded in `flyway_schema_history`, so every environment has the same schema.
+   `update` guesses the changes from the entities: it can't rename or drop safely, isn't reviewable,
+   and can drift between environments. With `validate`, a mismatch (a missing column, a wrong type)
+   makes Hibernate fail at startup with a schema-validation error, so the app never runs against the
+   wrong schema.</details>
 2. Your tests run against PostgreSQL in Testcontainers instead of H2. What's the trade-off, and what
    could an H2-based test miss in a banking app?
+   <details><summary>Answer</summary>The cost is Docker as a requirement and a few seconds of container
+   start-up. The benefit is testing the database you run in production. H2 differs in locking (`FOR
+   UPDATE` / `FOR NO KEY UPDATE` semantics, deadlock detection), constraint behaviour, `NUMERIC`
+   handling and SQL dialect. A concurrency or constraint test that passes on H2 proves little about
+   PostgreSQL.</details>
 3. What is ProblemDetail, and how does a `@RestControllerAdvice` that extends
    `ResponseEntityExceptionHandler` change what a client sees for a malformed JSON body?
+   <details><summary>Answer</summary>ProblemDetail is the RFC 9457 standard error body (`type`,
+   `title`, `status`, `detail`, `instance`, plus extensions), served as `application/problem+json`.
+   Extending `ResponseEntityExceptionHandler` makes Spring MVC's own exceptions use that format. A
+   malformed body then returns a 400 ProblemDetail (here with "Malformed JSON request", or an `errors`
+   entry naming the bad field) instead of the default error page or a body that leaks Jackson internals.</details>
 
 ---
 
@@ -98,10 +265,24 @@ Postgres, and one full-stack test.
 **Practice questions**
 1. Why does `Account.version` use `Long` and not `long`? What would change in the SQL that Spring Data's
    `save()` runs?
+   <details><summary>Answer</summary>Our ids are assigned in Java, so Spring Data can't use "id is
+   null" to detect a new entity. With a `@Version` field it uses "version is null" instead. A `Long`
+   is null before the first insert, so `save()` calls `persist`: a single `INSERT`. A primitive `long`
+   is never null (it's 0), so `save()` would call `merge`: a `SELECT` by id first, then the
+   `INSERT`.</details>
 2. The service already rejects negative balances. Why also have `CHECK (balance >= 0)` in the database?
    What does each layer give you that the other doesn't?
+   <details><summary>Answer</summary>The service gives a clear business error (422 with a reason) and
+   knows the context. The constraint is a guarantee no code path can bypass: a bug, a race, a manual SQL
+   fix or a second service writing to the same table. If the Java check is ever wrong, the database
+   refuses the write and the transaction rolls back, so the bad data never exists.</details>
 3. In a test, `new BigDecimal("100").equals(new BigDecimal("100.00"))` is false. Why, and how do you
    compare money safely in Java and in AssertJ?
+   <details><summary>Answer</summary>`BigDecimal.equals` compares value *and* scale: 100 (scale 0) and
+   100.00 (scale 2) are different objects to it. `compareTo` compares only the value. In Java use
+   `a.compareTo(b) == 0`, or normalise both to scale 2 first. In AssertJ use `isEqualByComparingTo`, or
+   `isEqualTo` when you deliberately want to assert the scale as well (this project does that for
+   stored amounts).</details>
 
 ---
 
@@ -727,3 +908,113 @@ then shuts down gracefully. With the shell form, `sh` would be PID 1 and might n
    <details><summary>Answer</summary>So `java` is PID 1 and receives `SIGTERM` on `docker stop` or an ECS
    task stop. Spring Boot then shuts down gracefully (finishes requests, closes the pool). In shell form,
    `/bin/sh -c` is PID 1, may not forward signals, and the container is killed after the timeout.</details>
+
+---
+
+## Stage 7: AWS (plan only, not deployed)
+
+### What we built
+A deployment plan in `docs/aws.md` and the infrastructure as CloudFormation in `infra/`: a budget
+with alerts, the application stack (VPC, ALB, ECS Fargate, RDS PostgreSQL 16, ECR, logs, IAM), a GitHub
+OIDC deploy role, and an inactive deploy workflow. The templates pass `cfn-lint`, but **nothing was
+created in AWS**: there's no account behind this yet. The cost estimate is ≈ $61/month if left running,
+≈ $0.08/hour, so a demo is well under $1 when torn down the same day.
+
+### Thought process
+**App Runner was the plan, and it's gone.** The original plan said "ECS Fargate or App Runner". The
+service-status check found that App Runner stopped accepting new customers on 30 April 2026, and AWS now
+recommends ECS Express Mode. Checking current status before writing anything is the point: a plan
+built on memory would have targeted a closed service.
+
+**ECS Fargate + ALB in plain CloudFormation, not Express Mode.**
+- Express Mode: fastest path, HTTPS URL included, shared ALB. But it builds the network and load
+  balancer for you, through a broad infrastructure role.
+- Plain resources: more YAML, but every security group rule and IAM statement is visible, which is
+  exactly what an interviewer at a bank will ask about. Express Mode is documented as the alternative.
+
+**No NAT gateway.** Tasks need outbound access (ECR, Secrets Manager). A NAT gateway would cost more than
+everything else combined. Instead tasks get a public IP in a public subnet, with a security group that
+only accepts the ALB. The trade-off: production would use private subnets with a NAT gateway or
+VPC endpoints, so the task has no public address at all.
+
+**Security groups as a chain.** Caller (your /32) → ALB :80 → app :8080 → RDS :5432. Each group
+references the previous one, not a CIDR, so only the right component can talk to the next one.
+
+**Secrets without secrets.** `ManageMasterUserPassword: true` makes RDS generate the password and store
+it in Secrets Manager. The task definition references `<secret-arn>:password::`, and ECS fetches it at
+start-up. The app still reads `DB_PASSWORD`, so the code is identical to local.
+
+**OIDC instead of access keys.** GitHub issues a signed token for each job. AWS verifies it against the
+registered provider and the role's trust conditions (`aud`, and `sub` = this repo + environment `aws`),
+and returns 1-hour credentials. There's nothing to leak or rotate in GitHub.
+
+**Teardown designed in.** `DeletionPolicy: Delete` on RDS (no orphan snapshot), `EmptyOnDelete` on ECR,
+log retention 7 days, no Elastic IPs. One `delete-stack` removes everything that costs money, and the
+doc lists the checks to prove it.
+
+### Walkthrough: the IAM pieces
+```yaml
+- Sid: ReadOnlyTheDatabaseSecret
+  Action: secretsmanager:GetSecretValue
+  Resource: !GetAtt Database.MasterUserSecret.SecretArn
+```
+The execution role can read exactly one secret. With `Resource: "*"` (what many tutorials show), a
+compromised task definition could read every secret in the account.
+```yaml
+"token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubRepository}:environment:aws"
+```
+Without the `sub` condition, *any* GitHub repository could assume the role: the provider alone only
+proves "this token came from GitHub", not "from my repo".
+```yaml
+Action: iam:PassRole
+Resource: arn:...:role/${AppStackName}-TaskExecutionRole-*
+Condition: { StringEquals: { "iam:PassedToService": ecs-tasks.amazonaws.com } }
+```
+The deploy role can only hand the execution role to ECS. Without this limit it could register a task
+definition with an admin role and run code as admin: privilege escalation through PassRole.
+
+### What an interviewer would challenge
+- **"Why not Kubernetes?"** One stateless service and one database: EKS adds a control plane fee,
+  cluster upgrades and a lot of YAML for no benefit at this size.
+- **"How would you make this highly available?"** `DesiredCount: 2` across both AZs (the ALB already
+  spans them), Multi-AZ RDS, and a NAT gateway per AZ or VPC endpoints. Roughly 2-3x the cost.
+- **"How does the app get the DB password? Can a developer see it?"** ECS injects it from Secrets
+  Manager at start-up. It's in no template, stack or task definition. Reading it requires
+  `GetSecretValue` on that ARN, which only the execution role (and admins) have. Access is logged in CloudTrail.
+- **"What happens when the password rotates?"** Honest answer: running tasks keep the old value, and new
+  connections fail after rotation until the service restarts. It's a known gap with two documented fixes.
+- **"How do you deploy schema changes?"** Flyway runs at app start-up. With one task that's fine. With
+  several tasks starting at once, Flyway's lock table serialises them, but the long-term fix is to run
+  migrations as a separate one-off task before the rollout, and to keep each migration backward-compatible
+  (expand/contract) so old and new versions can run side by side.
+- **"What does it cost, and how do you stop surprises?"** ≈ $2/day running. The budget is created first,
+  with alerts at 25% and 80% of actual spend and 100% of forecast. Alerts only send email: they don't stop
+  anything, so teardown is a written checklist.
+
+### Practice questions
+1. Why OIDC instead of storing AWS access keys as GitHub secrets?
+   <details><summary>Answer</summary>Access keys are long-lived: if they leak (logs, a malicious action,
+   a compromised maintainer account), they work until someone notices and rotates them. With OIDC, GitHub
+   issues a signed token per job, AWS checks the issuer, audience and subject (repo + environment), and
+   returns credentials that expire in an hour. There's no stored secret to leak, and the trust policy
+   decides exactly which workflows can deploy.</details>
+2. What's the difference between the task execution role and the task role?
+   <details><summary>Answer</summary>The execution role is used by the ECS agent *before and around* the
+   container: pulling the image, writing logs, fetching secrets to inject. The task role is what the
+   *application code* gets when it calls AWS APIs (for example S3). This app calls no AWS API, so it has
+   no task role. Least privilege means zero permissions, not "some read access just in case".</details>
+3. Why is `iam:PassRole` dangerous, and how is it limited here?
+   <details><summary>Answer</summary>PassRole lets you attach a role to a service (an ECS task, a Lambda).
+   If unrestricted, someone with deploy rights could attach an admin role to a task they control and run
+   code with admin permissions. Here it's limited to the one execution role and only when passed to
+   `ecs-tasks.amazonaws.com`.</details>
+4. Where does the money go in this setup, and how would you cut it?
+   <details><summary>Answer</summary>Roughly: Fargate $18, ALB $17, public IPv4 $11, RDS $14 per month.
+   Cuts: ARM/Graviton Fargate (~20% cheaper compute), a smaller task, scaling to zero when not demoing
+   (`DesiredCount: 0`), and deleting the stack between demos. Fewer public IPs means fewer subnets
+   or IPv6. What I wouldn't cut for a real bank: Multi-AZ, private subnets, TLS.</details>
+5. You run `delete-stack`. How do you prove nothing is still billing?
+   <details><summary>Answer</summary>The template avoids leftovers by design (no final DB snapshot, ECR
+   emptied on delete, no Elastic IPs). Then I list the billable resource types (RDS instances and manual
+   snapshots, load balancers, addresses, secrets, ECR repositories), all expected empty. The next day I
+   check Cost Explorer, and I keep the budget alert until a full billing period shows nothing.</details>

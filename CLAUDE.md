@@ -58,6 +58,6 @@ and reviews everything afterwards. The job is to make that review easy and compl
 
 ## Stages
 Done through Stage 6 (Docker: multi-stage, non-root; compose: app + postgres with health checks;
-CI: `.github/workflows/ci.yml`; Dependabot; Actuator `health` only). Stage 7 lives in `docs/aws.md`.
+CI: `.github/workflows/ci.yml`; Dependabot; Actuator `health` only). Stage 7 is prepared, not deployed: `docs/aws.md` and `infra/` (CloudFormation, checked with cfn-lint).
 
 1. Setup  2. Account  3. Transfer + ledger  4. Idempotency  5. Concurrency  6. Docker + CI + docs  7. AWS (plan only)

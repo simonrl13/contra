@@ -7,7 +7,7 @@ challenge, and practice questions (answers hidden in `<details>`).
 ---
 
 ## The 2-minute pitch
-> contra-api is a REST API for bank accounts and money transfers, built with Java 21, Spring Boot 4.1 and
+> contra-api is a REST API for bank accounts and money transfers, built with Java 21, Spring Boot 4.2 and
 > PostgreSQL 16. I built it to practise what matters in banking backends: correctness under failure and
 > under concurrency.
 >
@@ -849,7 +849,7 @@ Builds the jar. `-DskipTests` because the tests ran in CI (see above).
 ```dockerfile
 FROM eclipse-temurin:21-jre
 RUN groupadd --system --gid 10001 app && useradd --system --uid 10001 --gid app --no-create-home app
-COPY --from=build /workspace/target/contra-api-*.jar app.jar
+COPY --from=build /workspace/target/contra-*.jar app.jar
 USER app
 ```
 A fresh image: nothing from stage 1 except the jar. Remove `USER app` and the process runs as root.

@@ -19,3 +19,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Project targets Java 21 (LTS): only propose 21.x updates of the Temurin base images, never a new major.
+    ignore:
+      - dependency-name: eclipse-temurin
+        update-types: ["version-update:semver-major"]

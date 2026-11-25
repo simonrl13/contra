@@ -1,9 +1,9 @@
-# contra-api
+# contra
 
 [![CI](https://github.com/simonrl13/contra/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/simonrl13/contra/actions/workflows/ci.yml)
 
 A REST API for bank accounts and money transfers between them: a double-entry ledger, idempotent
-transfers, and safe concurrent updates. Java 21, Spring Boot 4.1, PostgreSQL 16.
+transfers, and safe concurrent updates. Java 21, Spring Boot 4.2, PostgreSQL 16.
 
 A learning and portfolio project, not a production system: there is no authentication (see
 [SECURITY.md](SECURITY.md)). Study notes for every stage are in [NOTES.md](NOTES.md), and the AWS

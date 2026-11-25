@@ -5,7 +5,7 @@ SQL, testing, Docker, AWS, live coding) and a portfolio project the owner can ex
 Learning matters more than speed.
 
 ## Stack
-- Java 21, Spring Boot 4.1.x (chosen over 4.0.x: 4.0 OSS support ends 2026-12-31), Maven via `./mvnw`
+- Java 21, Spring Boot 4.2.x (Dependabot bump from 4.1.3, merged 2026-11-25; 4.2 OSS support ends 2027-12-31), Maven via `./mvnw`
 - Spring Web MVC, Spring Data JPA, Bean Validation, PostgreSQL 16, Flyway (`ddl-auto: validate`, never `update`)
 - springdoc-openapi 3.x (Swagger UI at `/swagger-ui.html`)
 - Spring Boot Actuator (`/actuator/health` only, for health checks)

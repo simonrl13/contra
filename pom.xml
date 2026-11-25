@@ -13,9 +13,9 @@
 	</parent>
 
 	<groupId>com.contra</groupId>
-	<artifactId>contra-api</artifactId>
+	<artifactId>contra</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
-	<name>contra-api</name>
+	<name>contra</name>
 	<description>REST API for bank accounts and money transfers</description>
 
 	<properties>

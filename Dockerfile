@@ -13,7 +13,7 @@ RUN ./mvnw -B -q package -DskipTests
 FROM eclipse-temurin:21-jre
 RUN groupadd --system --gid 10001 app && useradd --system --uid 10001 --gid app --no-create-home app
 WORKDIR /app
-COPY --from=build /workspace/target/contra-api-*.jar app.jar
+COPY --from=build /workspace/target/contra-*.jar app.jar
 # Non-root: if the app is compromised, the attacker isn't root inside the container.
 USER app
 EXPOSE 8080

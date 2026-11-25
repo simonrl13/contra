@@ -20,7 +20,7 @@ idempotent transfers and pessimistic locking, tested against real PostgreSQL.
   [running cost about $X/day, torn down after the demo].
 -->
 
-**Stack:** Java 21 · Spring Boot 4.1 (Web MVC, Data JPA, Validation, Actuator) · PostgreSQL 16 · Flyway ·
+**Stack:** Java 21 · Spring Boot 4.2 (Web MVC, Data JPA, Validation, Actuator) · PostgreSQL 16 · Flyway ·
 JUnit 5 · Mockito · AssertJ · Testcontainers · Docker · GitHub Actions · CloudFormation (AWS plan)
 
 **Repo:** https://github.com/simonrl13/contra

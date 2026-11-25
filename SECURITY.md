@@ -49,7 +49,7 @@ caller owns the source account.
 - Idempotency keys are global and never expire (see the threat model).
 - No lock timeout: a transaction stuck while holding an account lock makes other transfers on that
   account wait. Mitigation if needed: `lock_timeout` / `idle_in_transaction_session_timeout` in PostgreSQL.
-- Supported framework line: Spring Boot 4.1.x, whose open-source support ends 2027-07-31.
+- Supported framework line: Spring Boot 4.2.x, whose open-source support ends 2027-12-31.
 
 ## Dependency policy
 - Spring Boot's parent pom manages versions. Anything it doesn't manage (springdoc) is pinned explicitly in `pom.xml`.

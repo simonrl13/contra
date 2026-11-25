@@ -1,5 +1,5 @@
 # Stage 1: build the jar with the Maven wrapper (JDK image, not shipped).
-FROM eclipse-temurin:21-jdk AS build
+FROM eclipse-temurin:25-jdk AS build
 WORKDIR /workspace
 # Dependencies first: this layer is cached until pom.xml changes, so code-only changes rebuild fast.
 COPY mvnw pom.xml ./
@@ -10,7 +10,7 @@ COPY src src
 RUN ./mvnw -B -q package -DskipTests
 
 # Stage 2: runtime. JRE only, no Maven, no source code, no compiler.
-FROM eclipse-temurin:21-jre
+FROM eclipse-temurin:25-jre
 RUN groupadd --system --gid 10001 app && useradd --system --uid 10001 --gid app --no-create-home app
 WORKDIR /app
 COPY --from=build /workspace/target/contra-api-*.jar app.jar

@@ -1,11 +1,28 @@
 # contra-api
 
+[![CI](https://github.com/simonrl13/contra/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/simonrl13/contra/actions/workflows/ci.yml)
+
 A REST API for bank accounts and money transfers between them: a double-entry ledger, idempotent
 transfers, and safe concurrent updates. Java 21, Spring Boot 4.1, PostgreSQL 16.
 
 A learning and portfolio project, not a production system: there is no authentication (see
 [SECURITY.md](SECURITY.md)). Study notes for every stage are in [NOTES.md](NOTES.md), and the AWS
 deployment plan is in [docs/aws.md](docs/aws.md) (prepared, not deployed).
+
+## Highlights
+Each point is backed by a test in `src/test` or a real run:
+- **Double-entry ledger.** Every transfer writes a debit and a credit in the same transaction as the
+  balance updates. Tests check that each account's balance equals the sum of its ledger entries, and
+  that a failed ledger write rolls everything back.
+- **Idempotent transfers.** A retry with the same `Idempotency-Key` returns the original transfer and
+  moves no money. 8 concurrent requests with one key still move money exactly once.
+- **Safe under concurrency.** 200 transfers from 16 threads against real PostgreSQL: no negative
+  balance, total money unchanged. The test fails if the row locks or the lock ordering are removed
+  (checked by hand).
+- **Tested on the real database.** 67 tests (unit, web and JPA slices, full-stack) run against
+  PostgreSQL 16 in Testcontainers, on every push via GitHub Actions.
+- **Container-ready.** Multi-stage Docker image running as a non-root user; `docker compose` brings up
+  the app and the database with health checks.
 
 ## Requirements
 - JDK 21

@@ -134,8 +134,9 @@ Layers: Controller → Service → Repository (Spring Data JPA) → PostgreSQL. 
   broken CI on Linux; a stale build after a manual file restore produced a misleading deadlock; and
   App Runner had closed to new customers, which a plan written from memory would have missed.
 - **Secrets scan**: `gitleaks` 8.30 over the full git history and the working tree found no leaks.
-- **Not verified**: the GitHub Actions workflow (no remote yet) and anything in AWS (templates only
-  pass `cfn-lint`).
+- **CI verified on GitHub**: since the repository was pushed, every GitHub Actions run has passed, starting
+  with the first (2026-11-25, `ce073d3`): `./mvnw verify` with all tests, then the Docker image build.
+- **Not verified**: anything in AWS (templates only pass `cfn-lint`).
 
 **What I'd check before trusting AI-generated code at a bank.**
 - **Money paths line by line**: rounding and scale, sign of every ledger entry, the order of check vs.
@@ -781,8 +782,9 @@ Verified by running it: `docker compose up -d --build --wait` brought both conta
 curl over HTTP exercised open account → transfer → retry with the same key (201, no second debit) →
 same key with a different body (422) → insufficient funds (422) → missing header (400) → balances and
 statement → `/actuator/env` (404). The jar was also started with `SPRINGDOC_APIDOCS_ENABLED=false` and
-`SPRINGDOC_SWAGGERUI_ENABLED=false`: both doc URLs returned 404. **Not verified:** the GitHub Actions
-workflow itself, because the repository has no GitHub remote yet. The first push will be its first run.
+`SPRINGDOC_SWAGGERUI_ENABLED=false`: both doc URLs returned 404. The GitHub Actions
+workflow was verified after the first push: its first run on GitHub (2026-11-25, `ce073d3`) passed both
+steps, `./mvnw verify` and the Docker image build.
 
 ### Thought process
 **Multi-stage build.**
@@ -903,7 +905,7 @@ then shuts down gracefully. With the shell form, `sh` would be PID 1 and might n
    <details><summary>Answer</summary>The workflow runs on every pull request: `./mvnw verify` runs all
    67 tests (including Testcontainers and concurrency tests on real PostgreSQL) and then builds the image.
    A PR that breaks either is red and shouldn't be merged. Branch protection requiring the check would
-   enforce that. It isn't configured, because there's no remote yet.</details>
+   enforce that. It isn't configured yet: the repository is on GitHub now, but `main` has no branch protection.</details>
 5. Why is the `ENTRYPOINT` in exec (JSON) form?
    <details><summary>Answer</summary>So `java` is PID 1 and receives `SIGTERM` on `docker stop` or an ECS
    task stop. Spring Boot then shuts down gracefully (finishes requests, closes the pool). In shell form,
